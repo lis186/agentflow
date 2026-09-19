@@ -310,12 +310,12 @@ const worker_environment = (command, requested_env, telemetry) => {
 
   if (task || role) {
     const headers = []
-    if (task) headers.push(`x-ccxray-task=${String(task).trim()}`)
-    if (role) headers.push(`x-ccxray-role=${String(role).trim()}`)
-    if (project) headers.push(`x-ccxray-project=${String(project).trim()}`)
-    const custom_str = headers.join(',')
+    if (task) headers.push(`x-ccxray-task: ${String(task).trim()}`)
+    if (role) headers.push(`x-ccxray-role: ${String(role).trim()}`)
+    if (project) headers.push(`x-ccxray-project: ${String(project).trim()}`)
+    const custom_str = headers.join('\n')
     if (environment.ANTHROPIC_CUSTOM_HEADERS) {
-      environment.ANTHROPIC_CUSTOM_HEADERS = `${environment.ANTHROPIC_CUSTOM_HEADERS},${custom_str}`
+      environment.ANTHROPIC_CUSTOM_HEADERS = `${environment.ANTHROPIC_CUSTOM_HEADERS}\n${custom_str}`
     } else {
       environment.ANTHROPIC_CUSTOM_HEADERS = custom_str
     }

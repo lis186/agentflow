@@ -17,17 +17,17 @@ describe('ccxray telemetry integration', () => {
       assert.equal(env.CCXRAY_TASK, 'A-012')
       assert.equal(env.CCXRAY_ROLE, 'cross-check')
       assert.equal(env.CCXRAY_PROJECT, 'ipadpos')
-      assert.match(env.ANTHROPIC_CUSTOM_HEADERS, /x-ccxray-task=A-012/)
-      assert.match(env.ANTHROPIC_CUSTOM_HEADERS, /x-ccxray-role=cross-check/)
-      assert.match(env.ANTHROPIC_CUSTOM_HEADERS, /x-ccxray-project=ipadpos/)
+      assert.match(env.ANTHROPIC_CUSTOM_HEADERS, /x-ccxray-task: A-012/)
+      assert.match(env.ANTHROPIC_CUSTOM_HEADERS, /x-ccxray-role: cross-check/)
+      assert.match(env.ANTHROPIC_CUSTOM_HEADERS, /x-ccxray-project: ipadpos/)
     })
 
     it('preserves existing ANTHROPIC_CUSTOM_HEADERS while appending telemetry', () => {
       const command = { executable: 'claude', args: [] }
-      const initialEnv = { ANTHROPIC_CUSTOM_HEADERS: 'my-custom=header' }
+      const initialEnv = { ANTHROPIC_CUSTOM_HEADERS: 'my-custom: header' }
       const env = runner.worker_environment(command, initialEnv, { task: 'B-001', role: 'worker' })
 
-      assert.match(env.ANTHROPIC_CUSTOM_HEADERS, /^my-custom=header,x-ccxray-task=B-001,x-ccxray-role=worker/)
+      assert.match(env.ANTHROPIC_CUSTOM_HEADERS, /^my-custom: header\nx-ccxray-task: B-001\nx-ccxray-role: worker/)
     })
 
     it('reads from existing process env if telemetry object is empty', () => {
