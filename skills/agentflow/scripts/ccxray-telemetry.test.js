@@ -103,6 +103,9 @@ describe('ccxray telemetry integration', () => {
                 total: 10120,
               },
               cache_hit_rate: 0.825,
+              tools: { Bash: 4, Edit: 2 },
+              tool_failures: 1,
+              skills: { agentflow: 1 },
             }))
             return
           }
@@ -143,6 +146,9 @@ describe('ccxray telemetry integration', () => {
       assert.equal(result.calls, 5)
       assert.equal(result.cost_usd, 0.1234)
       assert.equal(result.cache_hit_rate, 0.825)
+      assert.deepEqual(result.tools, { Bash: 4, Edit: 2 })
+      assert.equal(result.tool_failures, 1)
+      assert.deepEqual(result.skills, { agentflow: 1 })
       assert.equal(result.tokens.input, 1200)
       assert.equal(result.tokens.output, 340)
       assert.equal(result.tokens.cache, 8500)
@@ -163,6 +169,9 @@ describe('ccxray telemetry integration', () => {
       assert.equal(stage.stage_id, 'TASK-FOUND')
       assert.equal(stage.cost_usd, 0.1234)
       assert.equal(stage.cache_hit_rate, 0.825)
+      assert.deepEqual(stage.tools, { Bash: 4, Edit: 2 })
+      assert.equal(stage.tool_failures, 1)
+      assert.deepEqual(stage.skills, { agentflow: 1 })
       assert.equal(stage.provider_tokens.input, 1200)
       assert.equal(stage.provider_tokens.total, 10120)
       assert.equal(stage.provider_tokens.cache, 8500)

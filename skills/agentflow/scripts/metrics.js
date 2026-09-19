@@ -159,6 +159,9 @@ const create_stage_metrics = input => {
 	}
 	if (typeof input.cost_usd === 'number') stage.cost_usd = input.cost_usd
 	if (typeof input.cache_hit_rate === 'number') stage.cache_hit_rate = input.cache_hit_rate
+	if (input.tools && typeof input.tools === 'object') stage.tools = input.tools
+	if (typeof input.tool_failures === 'number') stage.tool_failures = input.tool_failures
+	if (input.skills && typeof input.skills === 'object') stage.skills = input.skills
 	const estimate = normalize_estimate(input.visible_text_token_estimate)
 	if (estimate !== undefined) stage.visible_text_token_estimate = estimate
 	return stage
@@ -455,6 +458,15 @@ const format_metrics_report = result => {
 			for (const field of TOKEN_FIELDS) lines.push('        - Provider ' + field + ' tokens: ' + stage.provider_tokens[field] + '.')
 			if (typeof stage.cost_usd === 'number') lines.push('        - Cost USD: $' + stage.cost_usd + '.')
 			if (typeof stage.cache_hit_rate === 'number') lines.push('        - Cache hit rate: ' + (Math.round(stage.cache_hit_rate * 1000) / 10) + '%.')
+			if (stage.tools && Object.keys(stage.tools).length > 0) {
+				const toolParts = Object.entries(stage.tools).map(([name, count]) => `${name} x${count}`)
+				const failSuffix = stage.tool_failures ? ` (failures: ${stage.tool_failures})` : ''
+				lines.push('        - Tools used: ' + toolParts.join(', ') + failSuffix + '.')
+			}
+			if (stage.skills && Object.keys(stage.skills).length > 0) {
+				const skillParts = Object.entries(stage.skills).map(([name, count]) => `${name} x${count}`)
+				lines.push('        - Skills invoked: ' + skillParts.join(', ') + '.')
+			}
 			if (stage.visible_text_token_estimate) lines.push('      - Visible-text token estimate: ' + stage.visible_text_token_estimate.value + ' (estimate).')
 			lines.push('      - Defects:')
 			if (stage.defects.length === 0) lines.push('        - None.')
@@ -575,6 +587,9 @@ const fetch_ccxray_metrics = async (task, options = {}) => {
 			calls: data.calls || 0,
 			cost_usd: typeof data.cost_usd === 'number' ? data.cost_usd : 0,
 			cache_hit_rate: typeof data.cache_hit_rate === 'number' ? data.cache_hit_rate : 0,
+			tools: data.tools && typeof data.tools === 'object' ? data.tools : {},
+			tool_failures: typeof data.tool_failures === 'number' ? data.tool_failures : 0,
+			skills: data.skills && typeof data.skills === 'object' ? data.skills : {},
 			tokens: {
 				input: t.input ?? 'unavailable',
 				output: t.output ?? 'unavailable',
@@ -597,6 +612,9 @@ const enrich_stage_with_ccxray = async (stage_input, options = {}) => {
 		provider_tokens: metrics_data.tokens,
 		cost_usd: metrics_data.cost_usd,
 		cache_hit_rate: metrics_data.cache_hit_rate,
+		tools: metrics_data.tools,
+		tool_failures: metrics_data.tool_failures,
+		skills: metrics_data.skills,
 	})
 }
 
