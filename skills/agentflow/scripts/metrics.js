@@ -61,10 +61,10 @@ const read_config = config_path => {
 }
 
 const metrics_enabled = config => {
-	if (config === 'on' || config === true) return true
+	if (config === 'on' || config === true || config === 'ccxray' || config === 'auto') return true
 	if (config === 'off' || config === false || config === undefined || config === null) return false
 	if (typeof config === 'string') return metrics_enabled(read_config(config))
-	return config.switches?.metrics === 'on'
+	return config.switches?.metrics === 'on' || config.switches?.metrics === 'ccxray' || config.switches?.metrics === 'auto'
 }
 
 const token_value = (value, label) => {
@@ -157,6 +157,11 @@ const create_stage_metrics = input => {
 		provider_tokens: normalize_provider_tokens(input.provider_tokens ?? input.provider_usage ?? input.usage ?? {}),
 		defects: defects.map(normalize_defect),
 	}
+	if (typeof input.cost_usd === 'number') stage.cost_usd = input.cost_usd
+	if (typeof input.cache_hit_rate === 'number') stage.cache_hit_rate = input.cache_hit_rate
+	if (input.tools && typeof input.tools === 'object') stage.tools = input.tools
+	if (typeof input.tool_failures === 'number') stage.tool_failures = input.tool_failures
+	if (input.skills && typeof input.skills === 'object') stage.skills = input.skills
 	const estimate = normalize_estimate(input.visible_text_token_estimate)
 	if (estimate !== undefined) stage.visible_text_token_estimate = estimate
 	return stage
@@ -362,11 +367,13 @@ const build_metrics_report = records => {
 		return [field, values.length > 0 && values.every(value => Number.isInteger(value)) ? values.reduce((total, value) => total + value, 0) : 'unavailable']
 	}))
 	const estimates = stages.map(stage => stage.visible_text_token_estimate?.value).filter(value => Number.isInteger(value))
+	const costs = stages.map(stage => stage.cost_usd).filter(value => typeof value === 'number')
 	return {
 		active_elapsed_ms,
 		waiting_elapsed_ms,
 		total_elapsed_ms: active_elapsed_ms + waiting_elapsed_ms,
 		provider_tokens,
+		...(costs.length > 0 ? { cost_usd: Math.round(costs.reduce((t, c) => t + c, 0) * 10000) / 10000 } : {}),
 		...(estimates.length > 0 ? { visible_text_token_estimate: { value: estimates.reduce((total, value) => total + value, 0), label: 'estimate' } } : {}),
 		stages,
 	}
@@ -449,6 +456,17 @@ const format_metrics_report = result => {
 			lines.push('      - Transport failures: ' + stage.transport_failures + '; ' + stage.transport_failure_elapsed_ms + ' ms lost.')
 			lines.push('      - Provider tokens:')
 			for (const field of TOKEN_FIELDS) lines.push('        - Provider ' + field + ' tokens: ' + stage.provider_tokens[field] + '.')
+			if (typeof stage.cost_usd === 'number') lines.push('        - Cost USD: $' + stage.cost_usd + '.')
+			if (typeof stage.cache_hit_rate === 'number') lines.push('        - Cache hit rate: ' + (Math.round(stage.cache_hit_rate * 1000) / 10) + '%.')
+			if (stage.tools && Object.keys(stage.tools).length > 0) {
+				const toolParts = Object.entries(stage.tools).map(([name, count]) => `${name} x${count}`)
+				const failSuffix = stage.tool_failures ? ` (failures: ${stage.tool_failures})` : ''
+				lines.push('        - Tools used: ' + toolParts.join(', ') + failSuffix + '.')
+			}
+			if (stage.skills && Object.keys(stage.skills).length > 0) {
+				const skillParts = Object.entries(stage.skills).map(([name, count]) => `${name} x${count}`)
+				lines.push('        - Skills invoked: ' + skillParts.join(', ') + '.')
+			}
 			if (stage.visible_text_token_estimate) lines.push('      - Visible-text token estimate: ' + stage.visible_text_token_estimate.value + ' (estimate).')
 			lines.push('      - Defects:')
 			if (stage.defects.length === 0) lines.push('        - None.')
@@ -460,6 +478,7 @@ const format_metrics_report = result => {
 	}
 	lines.push('- Exact provider token totals:')
 	for (const field of TOKEN_FIELDS) lines.push('  - Provider ' + field + ' tokens: ' + result.report.provider_tokens[field] + '.')
+	if (typeof result.report.cost_usd === 'number') lines.push('- Total cost: $' + result.report.cost_usd + '.')
 	if (result.report.visible_text_token_estimate) lines.push('- Visible-text token estimate total: ' + result.report.visible_text_token_estimate.value + ' (estimate; excluded from exact provider totals).')
 	return lines.join('\n')
 }
@@ -489,6 +508,114 @@ const parse_cli = argv => {
 		history_path: history_path || (config_path ? history_path_for(config_path) : history_path_for('ag.json')),
 		window,
 	}
+}
+
+const detect_ccxray_endpoint = () => {
+	if (process.env.CCXRAY_ENDPOINT) return process.env.CCXRAY_ENDPOINT
+	try {
+		const os = require('node:os')
+		const ccxray_home = process.env.CCXRAY_HOME || node_path.join(os.homedir(), '.ccxray')
+		const hub_lock_path = node_path.join(ccxray_home, 'hub.json')
+		if (fs.existsSync(hub_lock_path)) {
+			const lock = JSON.parse(fs.readFileSync(hub_lock_path, 'utf8'))
+			if (lock && Number.isInteger(lock.port)) {
+				let is_alive = true
+				if (lock.pid) {
+					try { process.kill(lock.pid, 0) } catch { is_alive = false }
+				}
+				if (is_alive) return `http://127.0.0.1:${lock.port}`
+			}
+		}
+	} catch {}
+	return null
+}
+
+const probe_http_health = url => new Promise(resolve => {
+	try {
+		const http = require('node:http')
+		const u = new URL('/_api/health', url)
+		const req = http.get(u, { timeout: 150 }, res => {
+			res.resume()
+			resolve(res.statusCode === 200)
+		})
+		req.on('error', () => resolve(false))
+		req.on('timeout', () => { req.destroy(); resolve(false) })
+	} catch {
+		resolve(false)
+	}
+})
+
+const resolve_ccxray_endpoint = async (options = {}) => {
+	if (options.endpoint) return options.endpoint
+	if (options.ccxray_endpoint) return options.ccxray_endpoint
+	const fast = detect_ccxray_endpoint()
+	if (fast) return fast
+
+	const default_url = 'http://127.0.0.1:5577'
+	const alive = await probe_http_health(default_url)
+	if (alive) return default_url
+	return null
+}
+
+const fetch_ccxray_metrics = async (task, options = {}) => {
+	if (!task || typeof task !== 'string' || !task.trim()) return null
+	const endpoint = await resolve_ccxray_endpoint(options)
+	if (!endpoint) return null
+	const project = options.project || process.env.CCXRAY_PROJECT
+	const url = new URL('/api/task-summary', endpoint)
+	url.searchParams.set('task', task.trim())
+	if (project) url.searchParams.set('project', project.trim())
+
+	try {
+		const controller = new AbortController()
+		const timeout = setTimeout(() => controller.abort(), options.timeout_ms || 3000)
+		const res = await fetch(url.toString(), {
+			method: 'GET',
+			headers: { 'Accept': 'application/json' },
+			signal: controller.signal,
+		})
+		clearTimeout(timeout)
+		if (!res.ok) return null
+		const data = await res.json()
+		if (!data || typeof data !== 'object') return null
+
+		const t = data.tokens || {}
+		const cache_tokens = (t.cache_read || 0) + (t.cache_create || 0)
+		return {
+			task: data.task,
+			project: data.project,
+			calls: data.calls || 0,
+			cost_usd: typeof data.cost_usd === 'number' ? data.cost_usd : 0,
+			cache_hit_rate: typeof data.cache_hit_rate === 'number' ? data.cache_hit_rate : 0,
+			tools: data.tools && typeof data.tools === 'object' ? data.tools : {},
+			tool_failures: typeof data.tool_failures === 'number' ? data.tool_failures : 0,
+			skills: data.skills && typeof data.skills === 'object' ? data.skills : {},
+			tokens: {
+				input: t.input ?? 'unavailable',
+				output: t.output ?? 'unavailable',
+				cache: cache_tokens,
+				reasoning: t.reasoning ?? 0,
+				total: t.total ?? 'unavailable',
+			},
+		}
+	} catch {
+		return null
+	}
+}
+
+const enrich_stage_with_ccxray = async (stage_input, options = {}) => {
+	const task_id = stage_input.task_id || stage_input.task || stage_input.stage_id
+	const metrics_data = await fetch_ccxray_metrics(task_id, options)
+	if (!metrics_data) return create_stage_metrics(stage_input)
+	return create_stage_metrics({
+		...stage_input,
+		provider_tokens: metrics_data.tokens,
+		cost_usd: metrics_data.cost_usd,
+		cache_hit_rate: metrics_data.cache_hit_rate,
+		tools: metrics_data.tools,
+		tool_failures: metrics_data.tool_failures,
+		skills: metrics_data.skills,
+	})
 }
 
 const main = argv => {
@@ -533,4 +660,8 @@ module.exports = {
 	append_history_record: append_metrics_history,
 	record_work_item: record_completed_work_item,
 	evaluate_metrics: evaluate_history,
+	fetch_ccxray_metrics,
+	enrich_stage_with_ccxray,
+	detect_ccxray_endpoint,
+	resolve_ccxray_endpoint,
 }
