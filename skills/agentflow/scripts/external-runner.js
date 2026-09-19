@@ -284,22 +284,44 @@ const host_markers = Object.freeze({
   claude: ['CLAUDE_PROJECT_DIR', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CLI'],
 })
 
-const worker_environment = (command, requested_env) => {
+const worker_environment = (command, requested_env, telemetry) => {
   const environment = { ...(requested_env || process.env) }
   const executable = node_path.basename(command.executable)
   const opposite = executable === 'claude' ? 'codex' : executable === 'codex' ? 'claude' : null
   if (opposite !== null) for (const marker of host_markers[opposite]) delete environment[marker]
+
+  const task = telemetry?.task || environment.CCXRAY_TASK
+  const role = telemetry?.role || environment.CCXRAY_ROLE
+  const project = telemetry?.project || environment.CCXRAY_PROJECT
+
+  if (task) environment.CCXRAY_TASK = String(task).trim()
+  if (role) environment.CCXRAY_ROLE = String(role).trim()
+  if (project) environment.CCXRAY_PROJECT = String(project).trim()
+
+  if (task || role) {
+    const headers = []
+    if (task) headers.push(`x-ccxray-task=${String(task).trim()}`)
+    if (role) headers.push(`x-ccxray-role=${String(role).trim()}`)
+    if (project) headers.push(`x-ccxray-project=${String(project).trim()}`)
+    const custom_str = headers.join(',')
+    if (environment.ANTHROPIC_CUSTOM_HEADERS) {
+      environment.ANTHROPIC_CUSTOM_HEADERS = `${environment.ANTHROPIC_CUSTOM_HEADERS},${custom_str}`
+    } else {
+      environment.ANTHROPIC_CUSTOM_HEADERS = custom_str
+    }
+  }
+
   return environment
 }
 
-const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes, termination_grace_ms, max_output_bytes, env, result_file_path }) => new Promise(resolve => {
+const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes, termination_grace_ms, max_output_bytes, env, result_file_path, task, role, project }) => new Promise(resolve => {
   const stdout_capture = make_capture(max_output_bytes)
   const stderr_capture = make_capture(max_output_bytes)
   let child
   try {
     child = node_child_process.spawn(command.executable, command.args, {
       cwd,
-      env: worker_environment(command, env),
+      env: worker_environment(command, env, { task, role, project }),
       shell: false,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -661,7 +683,7 @@ const run_external_command = async options => {
   const output_collision = declared_result_output_collision(command, clone.root, result_file_path)
   if (output_collision !== null) throw new Error(`Codex ${output_collision.option} must not be used when a declared result path is configured`)
   const before_snapshot = clone_snapshot(clone.root)
-  const child_result = await run_child({ command, cwd: clone.root, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes: values.list_processes, termination_grace_ms, max_output_bytes, env: values.env, result_file_path })
+  const child_result = await run_child({ command, cwd: clone.root, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes: values.list_processes, termination_grace_ms, max_output_bytes, env: values.env, result_file_path, task: values.task, role: values.role, project: values.project })
   return make_result({ ...values, max_output_bytes }, clone, command, before_snapshot, child_result, result_file_path)
 }
 
