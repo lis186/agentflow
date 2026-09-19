@@ -539,7 +539,7 @@ const resolve_ccxray_endpoint = async (options = {}) => {
 	const fast = detect_ccxray_endpoint()
 	if (fast) return fast
 
-	const default_url = 'http://127.0.0.1:8080'
+	const default_url = 'http://127.0.0.1:5577'
 	const alive = await probe_http_health(default_url)
 	if (alive) return default_url
 	return null
