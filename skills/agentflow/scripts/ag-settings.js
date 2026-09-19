@@ -612,7 +612,7 @@ const validate_switches = (config, options, expected_switches, provider_values, 
 		streams: ['ask', 'always', 'off'],
 		'ask-names': ['on', 'off'],
 		'allow-ag': ['on', 'off', 'ask'],
-		metrics: ['off', 'on', 'ccxray'],
+		metrics: ['off', 'on', 'ccxray', 'auto'],
 		'completion-cleanup': ['off', 'on'],
 	}
 	for (const [key, values] of Object.entries(legal_switches)) {
@@ -1725,7 +1725,7 @@ const format_settings_display = (config, options = {}) => {
 		'- streams: ask, always, or off; use streams: <value>',
 		'- ask-names: on or off; use ask-names: <value>',
 		'- allow-ag: on, off, or ask; use allow-ag: <value>',
-		'- metrics: off, on, or ccxray; use metrics: <value>',
+		'- metrics: off, on, ccxray, or auto; use metrics: <value>',
 		'- large-work-minutes: integer from 1 through 10080; use large-work-minutes: <value>',
 		'- completion-cleanup: off or on; use completion-cleanup: <value>',
 		'- completion-cleanup-interval-days: integer from 1 through 365; use completion-cleanup-interval-days: <value>',

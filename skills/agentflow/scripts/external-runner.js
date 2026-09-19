@@ -6,6 +6,7 @@ const node_fs = require('node:fs')
 const node_os = require('node:os')
 const node_path = require('node:path')
 const { contain_nested_processes, find_nested_processes, read_process_table } = require('./process-tree.js')
+const { detect_ccxray_endpoint, resolve_ccxray_endpoint } = require('./metrics.js')
 
 const MAX_OUTPUT_BYTES = 4096
 const DEFAULT_TIMEOUT_MS = 0
@@ -293,10 +294,19 @@ const worker_environment = (command, requested_env, telemetry) => {
   const task = telemetry?.task || environment.CCXRAY_TASK
   const role = telemetry?.role || environment.CCXRAY_ROLE
   const project = telemetry?.project || environment.CCXRAY_PROJECT
+  const endpoint = telemetry?.endpoint || (telemetry?.task || telemetry?.role ? detect_ccxray_endpoint() : null)
 
   if (task) environment.CCXRAY_TASK = String(task).trim()
   if (role) environment.CCXRAY_ROLE = String(role).trim()
   if (project) environment.CCXRAY_PROJECT = String(project).trim()
+
+  if (endpoint) {
+    if (executable === 'claude') {
+      environment.ANTHROPIC_BASE_URL = environment.ANTHROPIC_BASE_URL || endpoint
+    } else if (executable === 'codex') {
+      environment.OPENAI_BASE_URL = environment.OPENAI_BASE_URL || `${endpoint}/v1`
+    }
+  }
 
   if (task || role) {
     const headers = []
@@ -314,14 +324,30 @@ const worker_environment = (command, requested_env, telemetry) => {
   return environment
 }
 
-const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes, termination_grace_ms, max_output_bytes, env, result_file_path, task, role, project }) => new Promise(resolve => {
+const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes, termination_grace_ms, max_output_bytes, env, result_file_path, task, role, project, endpoint }) => new Promise(resolve => {
   const stdout_capture = make_capture(max_output_bytes)
   const stderr_capture = make_capture(max_output_bytes)
+  const executable = node_path.basename(command.executable)
+  const ccxray_endpoint = endpoint || detect_ccxray_endpoint()
+  let child_args = [...command.args]
+
+  if (ccxray_endpoint && executable === 'codex' && (task || role)) {
+    const baseUrl = `${ccxray_endpoint}/v1`
+    const mpConfig = `model_providers.ccxray={name="ccxray", base_url="${baseUrl}", wire_api="responses", http_headers={"x-ccxray-task"="${task || ''}", "x-ccxray-role"="${role || ''}", "x-ccxray-project"="${project || ''}"}}`
+    child_args = [
+      '-c', mpConfig,
+      '-c', 'model_provider="ccxray"',
+      '-c', `openai_base_url="${baseUrl}"`,
+      '-c', `chatgpt_base_url="${baseUrl}"`,
+      ...child_args,
+    ]
+  }
+
   let child
   try {
-    child = node_child_process.spawn(command.executable, command.args, {
+    child = node_child_process.spawn(command.executable, child_args, {
       cwd,
-      env: worker_environment(command, env, { task, role, project }),
+      env: worker_environment(command, env, { task, role, project, endpoint: ccxray_endpoint }),
       shell: false,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -683,7 +709,8 @@ const run_external_command = async options => {
   const output_collision = declared_result_output_collision(command, clone.root, result_file_path)
   if (output_collision !== null) throw new Error(`Codex ${output_collision.option} must not be used when a declared result path is configured`)
   const before_snapshot = clone_snapshot(clone.root)
-  const child_result = await run_child({ command, cwd: clone.root, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes: values.list_processes, termination_grace_ms, max_output_bytes, env: values.env, result_file_path, task: values.task, role: values.role, project: values.project })
+  const ccxray_endpoint = await resolve_ccxray_endpoint(values)
+  const child_result = await run_child({ command, cwd: clone.root, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes: values.list_processes, termination_grace_ms, max_output_bytes, env: values.env, result_file_path, task: values.task, role: values.role, project: values.project, endpoint: ccxray_endpoint })
   return make_result({ ...values, max_output_bytes }, clone, command, before_snapshot, child_result, result_file_path)
 }
 
@@ -699,4 +726,6 @@ module.exports = {
   declared_result_output_collision,
   worker_environment,
   run_external_command,
+  detect_ccxray_endpoint,
+  resolve_ccxray_endpoint,
 }

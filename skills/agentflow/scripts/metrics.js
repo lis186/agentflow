@@ -61,10 +61,10 @@ const read_config = config_path => {
 }
 
 const metrics_enabled = config => {
-	if (config === 'on' || config === true || config === 'ccxray') return true
+	if (config === 'on' || config === true || config === 'ccxray' || config === 'auto') return true
 	if (config === 'off' || config === false || config === undefined || config === null) return false
 	if (typeof config === 'string') return metrics_enabled(read_config(config))
-	return config.switches?.metrics === 'on' || config.switches?.metrics === 'ccxray'
+	return config.switches?.metrics === 'on' || config.switches?.metrics === 'ccxray' || config.switches?.metrics === 'auto'
 }
 
 const token_value = (value, label) => {
@@ -498,9 +498,57 @@ const parse_cli = argv => {
 	}
 }
 
+const detect_ccxray_endpoint = () => {
+	if (process.env.CCXRAY_ENDPOINT) return process.env.CCXRAY_ENDPOINT
+	try {
+		const os = require('node:os')
+		const ccxray_home = process.env.CCXRAY_HOME || node_path.join(os.homedir(), '.ccxray')
+		const hub_lock_path = node_path.join(ccxray_home, 'hub.json')
+		if (fs.existsSync(hub_lock_path)) {
+			const lock = JSON.parse(fs.readFileSync(hub_lock_path, 'utf8'))
+			if (lock && Number.isInteger(lock.port)) {
+				let is_alive = true
+				if (lock.pid) {
+					try { process.kill(lock.pid, 0) } catch { is_alive = false }
+				}
+				if (is_alive) return `http://127.0.0.1:${lock.port}`
+			}
+		}
+	} catch {}
+	return null
+}
+
+const probe_http_health = url => new Promise(resolve => {
+	try {
+		const http = require('node:http')
+		const u = new URL('/_api/health', url)
+		const req = http.get(u, { timeout: 150 }, res => {
+			res.resume()
+			resolve(res.statusCode === 200)
+		})
+		req.on('error', () => resolve(false))
+		req.on('timeout', () => { req.destroy(); resolve(false) })
+	} catch {
+		resolve(false)
+	}
+})
+
+const resolve_ccxray_endpoint = async (options = {}) => {
+	if (options.endpoint) return options.endpoint
+	if (options.ccxray_endpoint) return options.ccxray_endpoint
+	const fast = detect_ccxray_endpoint()
+	if (fast) return fast
+
+	const default_url = 'http://127.0.0.1:8080'
+	const alive = await probe_http_health(default_url)
+	if (alive) return default_url
+	return null
+}
+
 const fetch_ccxray_metrics = async (task, options = {}) => {
 	if (!task || typeof task !== 'string' || !task.trim()) return null
-	const endpoint = options.endpoint || process.env.CCXRAY_ENDPOINT || 'http://127.0.0.1:8080'
+	const endpoint = await resolve_ccxray_endpoint(options)
+	if (!endpoint) return null
 	const project = options.project || process.env.CCXRAY_PROJECT
 	const url = new URL('/api/task-summary', endpoint)
 	url.searchParams.set('task', task.trim())
@@ -596,4 +644,6 @@ module.exports = {
 	evaluate_metrics: evaluate_history,
 	fetch_ccxray_metrics,
 	enrich_stage_with_ccxray,
+	detect_ccxray_endpoint,
+	resolve_ccxray_endpoint,
 }

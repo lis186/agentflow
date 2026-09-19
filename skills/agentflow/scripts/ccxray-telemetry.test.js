@@ -39,12 +39,43 @@ describe('ccxray telemetry integration', () => {
     })
   })
 
-  describe('ag-settings allows "metrics": "ccxray"', () => {
-    it('accepts ccxray as a valid metrics switch setting', () => {
+  describe('ag-settings allows "metrics": "ccxray" and "auto"', () => {
+    it('accepts ccxray and auto as valid metrics switch settings', () => {
       assert.equal(metrics.metrics_enabled('ccxray'), true)
+      assert.equal(metrics.metrics_enabled('auto'), true)
       assert.equal(metrics.metrics_enabled({ switches: { metrics: 'ccxray' } }), true)
+      assert.equal(metrics.metrics_enabled({ switches: { metrics: 'auto' } }), true)
       assert.equal(metrics.metrics_enabled({ switches: { metrics: 'on' } }), true)
       assert.equal(metrics.metrics_enabled({ switches: { metrics: 'off' } }), false)
+    })
+  })
+
+  describe('auto-detection and transparent proxying', () => {
+    it('detects ccxray port from hub.json', () => {
+      const fs = require('node:fs')
+      const os = require('node:os')
+      const path = require('node:path')
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'test-hub-'))
+      try {
+        fs.writeFileSync(path.join(tmpHome, 'hub.json'), JSON.stringify({ port: 8999, pid: process.pid }))
+        const prevHome = process.env.CCXRAY_HOME
+        process.env.CCXRAY_HOME = tmpHome
+        try {
+          const detected = metrics.detect_ccxray_endpoint()
+          assert.equal(detected, 'http://127.0.0.1:8999')
+        } finally {
+          if (prevHome) process.env.CCXRAY_HOME = prevHome
+          else delete process.env.CCXRAY_HOME
+        }
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true })
+      }
+    })
+
+    it('injects OPENAI_BASE_URL for codex when endpoint is detected', () => {
+      const command = { executable: 'codex', args: ['exec'] }
+      const env = runner.worker_environment(command, {}, { task: 'A-001', role: 'worker', endpoint: 'http://127.0.0.1:8999' })
+      assert.equal(env.OPENAI_BASE_URL, 'http://127.0.0.1:8999/v1')
     })
   })
 
