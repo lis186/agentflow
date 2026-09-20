@@ -8,6 +8,8 @@ Notable Agentflow changes, with the newest version first. Release metadata uses 
 
 - Optional ccxray telemetry attribution and per-stage cost and token enrichment for external Claude, Codex, and Grok workers.
 
+- Audit-grade ccxray cost reporting: `ccxray-summary --attempt` and `--cumulative` write immutable receipts under `.agentflow/evidence/ccxray/` (gitignored by default) and print the paste-ready devlog attempt line and cumulative block with `cost components` and `gaps` bullets; amounts are exact decimal sums of ccxray charge buckets, marked `~` for default rates and `+` for lower bounds. ccxray responses are validated against a consumer trust model (invariants I1–I13) and projected field by field; any failed or inconsistent query is reported as unknown, never as zero.
+
 ## [8.2.0] — 2026-09-13
 
 ### Added

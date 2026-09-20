@@ -203,7 +203,7 @@ Type `settings` to see the active values and available choices. To change one, s
 
 - `metrics: off|on|auto|ccxray` controls local records and ccxray telemetry: `off` disables both, `on` keeps local records, `auto` uses healthy ccxray optionally, and `ccxray` requires it.
 
-For an active external worker, run `node metrics.js ccxray-summary --task <Ask id> --role <stage> --project <name> --config <ag.json> --format devlog` for its RUN, then run it without `--role` before closeout for the Reply, and paste both outputs verbatim. The closeout total includes the coordinator when the host itself runs through ccxray (`ccxray claude`, `ccxray codex`, or `ANTHROPIC_BASE_URL` pointing at it); a `host_not_proxied` line means the host bypassed ccxray.
+For ccxray cost reporting, run `ccxray-summary --attempt --task <Ask> --role <stage> --config <ag.json> --format devlog` after each worker attempt and `--cumulative` at closeout, paste the output verbatim, and treat `.agentflow/evidence/ccxray/` receipts as the audit record; all figures are modeled from recorded rates, not invoices.
 
 - `large-work-minutes` defaults to 120; valid values are 1–10080. It sets the workflow’s large-work time threshold.
 

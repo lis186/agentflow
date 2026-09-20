@@ -106,6 +106,7 @@ const launch_threeways_debate = async (facts, dependencies = {}) => {
 	}
 	const runner_options = { ...facts.runner_options, command: [worker.executable, ...worker.args, ...facts.runner_arguments] }
 	if (!Object.hasOwn(facts.runner_options, 'role')) runner_options.role = plan.stage_id
+	if (!Object.hasOwn(facts.runner_options, 'attempt')) runner_options.attempt = plan.round
 	const result = await run_external_command(runner_options)
 	return { ...plan, worker, runner_id: 'external-runner-v1', runner: result }
 }

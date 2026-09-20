@@ -78,8 +78,13 @@ not a general guarantee that code or a model claim is honest.
 - **`metrics.js`** — optionally writes validated metrics history and evaluates
   an evidence window. It writes no history when `metrics` is `off`, preserves
   unavailable provider fields as `unavailable`, can enrich stages from ccxray,
-  and never changes routing. `ccxray-summary --format devlog` emits paste-ready
-  ccxray bullets for the coordinator.
+  and never changes routing. For cost reporting, run `ccxray-summary --attempt`
+  after each worker attempt and `--cumulative` at closeout, paste the output
+  verbatim, and treat `.agentflow/evidence/ccxray/` receipts as the audit
+  record; all figures are modeled from recorded rates, not invoices. In a
+  receipt, scope `requests` and `known_usd` are numeric except when its query
+  fails: then both are `null`, `charges` is empty, and `scope_query_failed`
+  records the failure detail.
 
 - **`agf.js`** — the unified owner-facing command. It provides `start`, initialization, setup, hook management, settings, feature-stream work, and safe removal with focused subcommand help. `start --repo <path> --host <codex|claude> --message-stdin --json` resolves or initializes the project, records one exact owner message only in an empty Ask, runs intake, and returns structured startup facts without committing. `agf-looper` intentionally remains standalone. Internal validation and writing scripts are not public command families. Stream actions do not write the root notebook or replace a protocol round with an unrecorded direct Git sequence.
 

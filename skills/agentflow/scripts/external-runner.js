@@ -6,7 +6,7 @@ const node_fs = require('node:fs')
 const node_os = require('node:os')
 const node_path = require('node:path')
 const { contain_nested_processes, find_nested_processes, read_process_table } = require('./process-tree.js')
-const { build_ccxray_attribution_prefix, ccxray_install_guidance, ccxray_mode, resolve_ccxray_endpoint } = require('./metrics.js')
+const { build_ccxray_attribution_prefix, ccxray_install_guidance, ccxray_mode, record_host_touch, resolve_ccxray_endpoint } = require('./metrics.js')
 
 const MAX_OUTPUT_BYTES = 4096
 const DEFAULT_TIMEOUT_MS = 0
@@ -426,6 +426,7 @@ const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms,
   const stdout_capture = make_capture(max_output_bytes)
   const stderr_capture = make_capture(max_output_bytes)
   const child_args = apply_injection_args(command.args, injection)
+  const started_at = Date.now()
 
   let child
   try {
@@ -447,6 +448,8 @@ const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms,
       activity: { state: stall_timeout_ms > 0 ? 'not_observed' : 'disabled', stall_timeout_ms, sample_count: 0, elapsed_ms: 0, last_change_elapsed_ms: null, last_change_signs: [] },
       process_group_timeout: { trigger: 'none', attempted: false, signals: [], terminated: false, group_after: 'unknown', proof: 'not_needed' },
       nested_worker: { visible: false, detected: false, processes: [], containment: { attempted: false, actions: [] }, poll_count: 0 },
+      started_ms: started_at,
+      ended_ms: Date.now(),
     })
     return
   }
@@ -462,7 +465,6 @@ const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms,
   let finished = false
   let timeout_handle
   let nested_handle
-  const started_at = Date.now()
   let sample_count = 0
   let last_sample = null
   let last_change_at = started_at
@@ -531,6 +533,8 @@ const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms,
       },
       process_group_timeout: timeout_cleanup || { trigger: 'none', attempted: false, signals: [], terminated: false, group_after: 'not_alive', proof: 'not_needed' },
       nested_worker,
+      started_ms: started_at,
+      ended_ms: Date.now(),
     })
   }
 
@@ -743,6 +747,8 @@ const make_result = async (options, clone, command, before_snapshot, child_resul
       after: after_snapshot.identity,
       changed: before_snapshot.identity !== after_snapshot.identity,
     },
+    started_ms: child_result.started_ms,
+    ended_ms: child_result.ended_ms,
     process_group_timeout: child_result.process_group_timeout,
     nested_worker: {
       ...child_result.nested_worker,
@@ -782,12 +788,14 @@ const run_external_command = async options => {
   const stall_timeout_ms = values.stall_timeout_ms === undefined ? 0 : values.stall_timeout_ms
   const max_output_bytes = values.max_output_bytes === undefined ? MAX_OUTPUT_BYTES : values.max_output_bytes
   const nested_poll_ms = values.nested_poll_ms === undefined ? DEFAULT_NESTED_POLL_MS : values.nested_poll_ms
+  const attempt = values.attempt === undefined ? 1 : values.attempt
   if (!is_nonnegative_safe_integer(timeout_ms)) throw new Error('timeout_ms must be a non-negative safe integer')
   if (!is_positive_integer(termination_grace_ms)) throw new Error('termination_grace_ms must be a positive integer')
   if (!is_nonnegative_safe_integer(stall_timeout_ms)) throw new Error('stall_timeout_ms must be a non-negative safe integer')
   if (stall_timeout_ms !== 0) throw new Error('quiet-time termination is no longer supported; use an explicit deadline only when authorized')
   if (!is_positive_integer(max_output_bytes)) throw new Error('max_output_bytes must be a positive integer')
   if (!is_nonnegative_safe_integer(nested_poll_ms)) throw new Error('nested_poll_ms must be a non-negative safe integer')
+  if (!is_nonnegative_safe_integer(attempt)) throw new Error('attempt must be a non-negative safe integer')
 
   const clone = prepare_clone(values)
   const result_file_path = normalize_result_file(values.result_file, clone.root)
@@ -860,7 +868,29 @@ const run_external_command = async options => {
     }
   }
   const child_result = await run_child({ command, cwd: clone.root, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes: values.list_processes, termination_grace_ms, max_output_bytes, env: values.env, result_file_path, injection })
-  return make_result({ ...values, max_output_bytes }, clone, command, before_snapshot, child_result, result_file_path, telemetry)
+  const result = await make_result({ ...values, max_output_bytes }, clone, command, before_snapshot, child_result, result_file_path, telemetry)
+  if (task !== null) {
+    const cancelled = result.timed_out === true || result.signal !== null && result.signal !== undefined || result.status === 'timed_out' || result.status === 'terminated' || result.process_group_timeout?.trigger === 'deadline'
+    const outcome = cancelled ? 'cancelled' : result.process?.exit_code === 0 ? 'succeeded' : 'failed'
+    try {
+      record_host_touch({
+        repo_root: values.repo_root || values.source_directory || process.cwd(),
+        config_path: values.config_path,
+        config: values.config === undefined ? values.metrics : values.config,
+        env: values.touch_env === undefined ? { ...process.env, ...(values.env || {}) } : values.touch_env,
+        ask: task,
+        event: 'attempt',
+        role: role || 'unknown',
+        project,
+        attempt,
+        outcome,
+        started_ms: result.started_ms,
+        ended_ms: result.ended_ms,
+        ts: result.ended_ms,
+      })
+    } catch {}
+  }
+  return result
 }
 
 module.exports = {
