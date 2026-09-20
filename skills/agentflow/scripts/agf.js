@@ -26,6 +26,7 @@ const setup = require('./setup.js')
 const resume_intake = require('./resume-intake.js')
 const notebook_writer = require('./notebook-write.js')
 const completion_context = require('./completion-context.js')
+const metrics = require('./metrics.js')
 const { format_local_timestamp } = require('./local-time.js')
 
 const MAX_GIT_TIMEOUT_MS = 30_000
@@ -832,6 +833,7 @@ const start_main = (argv, cwd, log, _ask, _width = 80) => {
 			provenance: [],
 			git_identity,
 		})
+		metrics.record_host_touch({ repo_root: repo, config_path: config_file, ask: result.current_ask_identifier, event: 'start' })
 		return emit_start_result(result, args, repo, log)
 	}
 
@@ -878,7 +880,9 @@ const start_main = (argv, cwd, log, _ask, _width = 80) => {
 		release_start_lock(lock)
 		lock = null
 		const intake = resume_intake.collect_intake({ repo_root: repo, notebook_path: notebook, active_host: args.host, bootstrap_provenance: provenance })
-		return emit_start_result(start_result({ repo, host: args.host, notebook, notebook_text: message_result.text, intake, setup_result, message_result, provenance, git_identity }), args, repo, log)
+		const result = start_result({ repo, host: args.host, notebook, notebook_text: message_result.text, intake, setup_result, message_result, provenance, git_identity })
+		metrics.record_host_touch({ repo_root: repo, config_path: config_file, config: initialized.config, ask: result.current_ask_identifier, event: 'start' })
+		return emit_start_result(result, args, repo, log)
 	} finally {
 		if (lock !== null) release_start_lock(lock)
 	}
@@ -2285,7 +2289,9 @@ const close_main = (argv, cwd, log, _ask, _width = 80) => {
 			result.commit = { state: 'not_applicable' }
 			result.delivery.state = 'local'
 		} else result = close_execute({ repo, ...validated })
-		return { json: result.ok ? close_success_result(result) : result, exitCode: result.ok ? 0 : 1 }
+		const response = result.ok ? close_success_result(result) : result
+		if (response.ok === true) metrics.record_host_touch({ repo_root: repo, notebook_path: manifest.notebook, ask: manifest.ask, event: 'close' })
+		return { json: response, exitCode: response.ok ? 0 : 1 }
 	} catch (error) {
 		close_validation_failure(result, error.message)
 		set_close_error(result, error.code || 'invalid_manifest', error.message, 'correct the manifest or repository state, then retry the same command')

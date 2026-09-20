@@ -66,6 +66,226 @@ const start_server = handler => new Promise((resolve, reject) => {
 
 const close_server = server => new Promise(resolve => server.close(resolve))
 
+test('detects the host session id with current and legacy environment names', () => {
+  assert.deepEqual(metrics.host_session({ CODEX_THREAD_ID: 'thread', CODEX_SESSION_ID: 'session' }), { host: 'codex', session_id: 'thread' })
+  assert.deepEqual(metrics.host_session({ CODEX_SESSION_ID: 'session' }), { host: 'codex', session_id: 'session' })
+  assert.deepEqual(metrics.host_session({ CLAUDE_CODE_SESSION_ID: 'current' }), { host: 'claude', session_id: 'current' })
+  assert.deepEqual(metrics.host_session({ CLAUDE_SESSION_ID: 'legacy' }), { host: 'claude', session_id: 'legacy' })
+  assert.deepEqual(metrics.host_session({ CODEX_SESSION_ID: 'codex', CLAUDE_CODE_SESSION_ID: 'claude' }), { host: 'codex', session_id: 'codex' })
+  assert.deepEqual(metrics.host_session({}), { host: null, session_id: null })
+})
+
+test('records host touches only for ccxray modes and never throws on an unusable log path', () => {
+  const directory = make_temp_dir('agentflow-host-touch-')
+  const config = { switches: { metrics: 'auto', 'workspace-dir': '.agentflow' } }
+  const environment = { CODEX_THREAD_ID: 'codex-session' }
+  try {
+    assert.equal(metrics.record_host_touch({
+      repo_root: directory,
+      config,
+      env: environment,
+      ask: 'A-012',
+      event: 'start',
+      ts: 1000,
+    }), true)
+    assert.equal(metrics.record_host_touch({
+      repo_root: directory,
+      config,
+      env: { CLAUDE_CODE_SESSION_ID: 'claude-session' },
+      ask: 'A-012',
+      event: 'append-run',
+      ts: 2000,
+    }), true)
+    const log_path = path.join(directory, '.agentflow', '.tmp', 'host-sessions.jsonl')
+    assert.deepEqual(fs.readFileSync(log_path, 'utf8').trim().split('\n').map(line => JSON.parse(line)), [
+      { ask: 'A-012', session_id: 'codex-session', host: 'codex', ts: 1000, event: 'start' },
+      { ask: 'A-012', session_id: 'claude-session', host: 'claude', ts: 2000, event: 'append-run' },
+    ])
+
+    assert.equal(metrics.record_host_touch({
+      repo_root: directory,
+      config: { switches: { metrics: 'off', 'workspace-dir': '.agentflow-off' } },
+      env: environment,
+      ask: 'A-012',
+      event: 'start',
+      ts: 3000,
+    }), false)
+
+    const blocked = path.join(directory, 'blocked')
+    fs.writeFileSync(blocked, 'not a directory')
+    assert.doesNotThrow(() => metrics.record_host_touch({
+      repo_root: directory,
+      config: { switches: { metrics: 'ccxray', 'workspace-dir': 'blocked' } },
+      env: environment,
+      ask: 'A-012',
+      event: 'close',
+      ts: 4000,
+    }))
+  } finally {
+    remove_temp_dir(directory)
+  }
+})
+
+test('derives clipped, open-ended, malformed-safe, and capped host session intervals', () => {
+  const records = [
+    JSON.stringify({ ask: 'A-012', session_id: 's1', ts: 1_000, event: 'start' }),
+    JSON.stringify({ ask: 'A-012', session_id: 's2', ts: 1_500, event: 'start' }),
+    JSON.stringify({ ask: 'A-013', session_id: 's1', ts: 3_000, event: 'start' }),
+    JSON.stringify({ ask: 'A-012', session_id: 's1', ts: 2_000, event: 'close' }),
+    JSON.stringify({ ask: 'A-013', session_id: 's1', ts: 5_000, event: 'close-round' }),
+    JSON.stringify({ ask: 'A-012', session_id: 's2', ts: 6_000, event: 'close-round' }),
+    JSON.stringify({ ask: 'A-012', session_id: 's3', ts: 7_000, event: 'start' }),
+    '{malformed',
+    JSON.stringify({ ask: 'A-012', session_id: 's4', ts: 'bad', event: 'start' }),
+    JSON.stringify({ ask: 'A-012', session_id: 's5', ts: 9_000 }),
+  ]
+  // s1: A-012 closes at 2_000 and A-013 starts at 3_000; the boundary is the
+  // midpoint 2_500, applied identically from both sides (no double count).
+  assert.deepEqual(metrics.host_session_intervals('A-012', records, 10_000), [
+    { session: 's1', from: 0, to: 2_499 },
+    { session: 's2', from: 0, to: 126_000 },
+    { session: 's3', from: 0, to: null },
+  ])
+
+  const many = Array.from({ length: 33 }, (_, index) => [
+    JSON.stringify({ ask: 'A-012', session_id: `s${index}`, ts: 20_000 + index, event: 'start' }),
+    JSON.stringify({ ask: 'A-012', session_id: `s${index}`, ts: 30_000 + index, event: 'close' }),
+  ]).flat()
+  const capped = metrics.host_session_intervals('A-012', many, 40_000)
+  assert.equal(capped.length, 32)
+  assert.equal(capped[0].session, 's1')
+  assert.equal(capped.at(-1).session, 's32')
+
+  assert.deepEqual(metrics.host_session_intervals('A-014', [
+    JSON.stringify({ ask: 'A-014', session_id: 'shared', ts: 50_000, event: 'start' }),
+    JSON.stringify({ ask: 'A-015', session_id: 'shared', ts: 51_000, event: 'start' }),
+  ]), [{ session: 'shared', from: 0, to: 50_999 }])
+})
+
+test('two consecutive Asks in one session never share an instant', () => {
+  // Found in independent review: clipping each Ask against the other's nearest
+  // touch gave A `to = B.first` and B `from = A.last`, so a host request in the
+  // gap between them was counted under both Asks.
+  const records = [
+    JSON.stringify({ ask: 'A', session_id: 's', ts: 1_000_000, event: 'start' }),
+    JSON.stringify({ ask: 'A', session_id: 's', ts: 1_100_000, event: 'close' }),
+    JSON.stringify({ ask: 'B', session_id: 's', ts: 1_150_000, event: 'start' }),
+  ]
+  const [a] = metrics.host_session_intervals('A', records, 2_000_000)
+  const [b] = metrics.host_session_intervals('B', records, 2_000_000)
+  assert.deepEqual(a, { session: 's', from: 820_000, to: 1_124_999 })
+  assert.deepEqual(b, { session: 's', from: 1_125_000, to: null })
+  const in_gap = 1_120_000
+  const owners = [['A', a], ['B', b]].filter(([, interval]) => in_gap >= interval.from && (interval.to === null || in_gap <= interval.to)).map(([name]) => name)
+  assert.deepEqual(owners, ['A'])
+})
+
+test('no instant in a session ever belongs to two Asks, including interleaved and long-gap sequences', () => {
+  // Found in independent review: a shared boundary millisecond was owned by
+  // both neighbours, and two Asks interleaved in one session had overlapping
+  // first-to-last spans. Ownership is now a partition of the session timeline.
+  const touch = (ask, ts, event = 'start') => JSON.stringify({ ask, session_id: 's', ts, event })
+  const owners = (records, instant) => ['A', 'B'].filter(ask => metrics.host_session_intervals(ask, records, 9_000_000)
+    .some(interval => instant >= interval.from && (interval.to === null || instant <= interval.to)))
+
+  const short_gap = [touch('A', 1_000_000), touch('A', 1_100_000, 'close'), touch('B', 1_150_000), touch('B', 1_200_000, 'close')]
+  assert.deepEqual(owners(short_gap, 1_124_999), ['A'])
+  assert.deepEqual(owners(short_gap, 1_125_000), ['B'])
+
+  // A gap wider than lead + tail padding belongs to nobody: the host was not
+  // doing Agentflow work there.
+  const long_gap = [touch('A', 1_000_000), touch('A', 1_100_000, 'close'), touch('B', 1_600_000), touch('B', 1_700_000, 'close')]
+  assert.deepEqual(owners(long_gap, 1_219_999), ['A'])
+  assert.deepEqual(owners(long_gap, 1_300_000), [])
+  assert.deepEqual(owners(long_gap, 1_420_000), ['B'])
+
+  // Interleaved: B interrupts A, so A hands over at B's touch with no lead for B.
+  const interleaved = [touch('A', 1_000_000), touch('B', 1_100_000), touch('A', 1_200_000, 'close'), touch('B', 1_300_000, 'close')]
+  assert.deepEqual(metrics.host_session_intervals('A', interleaved, 9_000_000), [
+    { session: 's', from: 820_000, to: 1_099_999 },
+    { session: 's', from: 1_200_000, to: 1_249_999 },
+  ])
+  assert.deepEqual(metrics.host_session_intervals('B', interleaved, 9_000_000), [
+    { session: 's', from: 1_100_000, to: 1_199_999 },
+    { session: 's', from: 1_250_000, to: 1_420_000 },
+  ])
+  assert.deepEqual(owners(interleaved, 1_150_000), ['B'])
+
+  // Exhaustive: every two-Ask label/event sequence up to length 5, sampled instants.
+  const labels = ['A', 'B']
+  const events = ['start', 'close']
+  let sequences = 0
+  const walk = (prefix, depth) => {
+    if (depth === 0) {
+      const records = prefix.map((step, index) => touch(step[0], 1_000_000 + index * 50_000, step[1]))
+      for (let instant = 700_000; instant <= 1_500_000; instant += 12_500) assert.ok(owners(records, instant).length <= 1, JSON.stringify({ prefix, instant }))
+      sequences += 1
+      return
+    }
+    for (const label of labels) for (const event of events) walk([...prefix, [label, event]], depth - 1)
+  }
+  for (let length = 1; length <= 5; length += 1) walk([], length)
+  assert.equal(sequences, 4 + 16 + 64 + 256 + 1024)
+})
+
+test('codex override placement survives every value-taking root option and the joined config spelling', () => {
+  const context = { task: 'T', endpoint: 'http://127.0.0.1:5577' }
+  const shape = args => {
+    const injection = runner.ccxray_worker_injection({ executable: 'codex', args }, {}, context)
+    return { status: injection.status, reason: injection.reason, index: injection.arg_insert ? injection.arg_insert.index : null }
+  }
+  // Found in independent review: `-a never exec -c x=1` put the overrides at
+  // root level again, and codex dropped them.
+  for (const lead of [['-a', 'never'], ['--ask-for-approval', 'never'], ['--enable', 'foo'], ['--disable', 'bar'], ['-i', 'shot.png'], ['--add-dir', '/x'], ['--local-provider', 'ollama'], ['--remote', 'host:1'], ['--remote-auth-token-env', 'TOK']]) {
+    assert.deepEqual(shape([...lead, 'exec', '-c', 'x=1', 'prompt']), { status: 'active', reason: null, index: lead.length + 1 }, lead.join(' '))
+  }
+  for (const sub of ['resume', 'fork', 'apply', 'a']) {
+    assert.deepEqual(shape([sub, '--last']), { status: 'active', reason: null, index: 1 }, sub)
+  }
+  // An existing routing override in any spelling means we must not add ours.
+  for (const args of [
+    ['exec', '-c', 'openai_base_url="http://gw/v1"', 'p'],
+    ['exec', '--config', 'chatgpt_base_url="http://gw/v1"', 'p'],
+    ['--config=chatgpt_base_url="http://gw/v1"', 'exec', 'p'],
+  ]) assert.equal(shape(args).reason, 'custom_base_url', JSON.stringify(args))
+})
+
+test('codex respects a foreign inherited base URL like claude and grok do', () => {
+  const context = { task: 'T', endpoint: 'http://127.0.0.1:5577' }
+  const foreign = runner.ccxray_worker_injection({ executable: 'codex', args: ['exec', 'p'] }, { OPENAI_BASE_URL: 'https://gateway.example/v1' }, context)
+  assert.equal(foreign.status, 'skipped')
+  assert.equal(foreign.reason, 'custom_base_url')
+  assert.equal(foreign.arg_insert, undefined)
+  const foreign_chatgpt = runner.ccxray_worker_injection({ executable: 'codex', args: ['exec', 'p'] }, { CHATGPT_BASE_URL: 'https://gateway.example/backend-api/codex' }, context)
+  assert.equal(foreign_chatgpt.reason, 'custom_base_url')
+  // The same ccxray origin, spelled localhost, is not foreign.
+  const same = runner.ccxray_worker_injection({ executable: 'codex', args: ['exec', 'p'] }, { OPENAI_BASE_URL: 'http://localhost:5577/v1' }, context)
+  assert.equal(same.status, 'active')
+})
+
+test('devlog lines mark under-counted or default-rate costs and stamp the snapshot time', () => {
+  const summary = {
+    task: 'A-1', calls: 4, cost_usd: 0.5, cache_hit_rate: 0.5,
+    tokens: { input: 1, output: 1, cache: 1, total: 3 }, models: ['m'], agents: ['claude'],
+    cost_confidence: { priced: 2, unknown: 1, fallback: 1, no_usage: 1 },
+    as_of: '2026-09-20T10:00:00.000Z',
+    by_role: {
+      coordinator: { calls: 2, cost_usd: 0.1, tokens: { total: 1 }, cost_confidence: { priced: 1, unknown: 1, fallback: 0, no_usage: 0 } },
+      w: { calls: 2, cost_usd: 0.4, tokens: { total: 2 }, cost_confidence: { priced: 2, unknown: 0, fallback: 0, no_usage: 0 } },
+    },
+  }
+  assert.deepEqual(metrics.format_ccxray_devlog_lines(summary), [
+    '- ccxray A-1: 4 calls · ~$0.5000+ · tokens in 1 / out 1 / cache 1 (hit 50.0%) / total 3 · m via claude · as of 2026-09-20T10:00:00.000Z',
+    '  - cost is a lower bound: 1 not priced (unknown model); 1 without usage; 1 at default rates',
+    '  - coordinator: 2 calls · $0.1000+ · 1 tokens',
+    '  - w: 2 calls · $0.4000 · 2 tokens',
+  ])
+  // Fully priced, no stamp: the line is unchanged from before.
+  const clean = { ...summary, cost_confidence: { priced: 4, unknown: 0, fallback: 0, no_usage: 0 }, as_of: undefined, by_role: {} }
+  assert.equal(metrics.format_ccxray_devlog_lines(clean)[0], '- ccxray A-1: 4 calls · $0.5000 · tokens in 1 / out 1 / cache 1 (hit 50.0%) / total 3 · m via claude')
+  assert.equal(metrics.format_ccxray_devlog_lines(clean).length, 1)
+})
+
 test('builds one encoded attribution path segment and applies value rules', () => {
   assert.equal(
     metrics.build_ccxray_attribution_prefix({ task: 'A-012', role: 'cross-check', project: 'ipadpos' }),
@@ -281,6 +501,168 @@ test('fetches task summaries through the capability-gated API and filters empty 
   }
 })
 
+test('sends exact coordinator session parameters only when the health capability is present', async () => {
+  const queries = []
+  const { server, endpoint } = await start_server((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`)
+    if (url.pathname === '/_api/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, app: 'ccxray', capabilities: ['task-attribution', 'session-intervals'] }))
+      return
+    }
+    if (url.pathname === '/_api/task-summary') {
+      queries.push(url)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        task: 'A-012',
+        calls: 4,
+        by_role: { coordinator: { calls: 2 } },
+        coordinator: {
+          calls: 2,
+          cost_usd: 0.91,
+          sessions: [{ session: 'host-1', from: 1000, to: 2000, calls: 2 }],
+        },
+      }))
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+  try {
+    const result = await metrics.fetch_ccxray_metrics('A-012', {
+      endpoint,
+      sessions: [
+        { session: 'host-1', from: 1000, to: 2000 },
+        { session: 'host-2', from: 3000, to: null },
+      ],
+    })
+    assert.deepEqual(queries[0].searchParams.getAll('session'), ['host-1@1000-2000', 'host-2@3000-'])
+    assert.deepEqual(result.coordinator, {
+      calls: 2,
+      cost_usd: 0.91,
+      sessions: [{ session: 'host-1', from: 1000, to: 2000, calls: 2 }],
+    })
+  } finally {
+    await close_server(server)
+  }
+
+  const old_queries = []
+  const old = await start_server((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`)
+    if (url.pathname === '/_api/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, app: 'ccxray', capabilities: ['task-attribution'] }))
+      return
+    }
+    if (url.pathname === '/_api/task-summary') {
+      old_queries.push(url)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ task: 'A-012', calls: 1 }))
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+  try {
+    await metrics.fetch_ccxray_metrics('A-012', {
+      endpoint: old.endpoint,
+      sessions: [{ session: 'host-1', from: 1000, to: null }],
+    })
+    assert.deepEqual(old_queries[0].searchParams.getAll('session'), [])
+  } finally {
+    await close_server(old.server)
+  }
+})
+
+test('formats coordinator role totals and coordinator availability lines', () => {
+  const summary = {
+    task: 'A-012',
+    calls: 2,
+    cost_usd: 0.91,
+    cache_hit_rate: 0,
+    tokens: { input: 1, output: 2, cache: 0, total: 3 },
+    by_role: { coordinator: { calls: 2, cost_usd: 0.91, tokens: { total: 3 } } },
+    coordinator: { calls: 2, sessions: [{ session: 'host-1', from: 1000, to: null }] },
+  }
+  assert.deepEqual(metrics.format_ccxray_devlog_lines(summary), [
+    '- ccxray A-012: 2 calls · $0.9100 · tokens in 1 / out 2 / cache 0 (hit 0.0%) / total 3',
+    '  - coordinator: 2 calls · $0.9100 · 3 tokens',
+  ])
+  assert.deepEqual(metrics.format_ccxray_devlog_lines({ ...summary, coordinator: { calls: 0, sessions: [{ session: 'host-1' }] } }), [
+    '- ccxray A-012: 2 calls · $0.9100 · tokens in 1 / out 2 / cache 0 (hit 0.0%) / total 3',
+    '  - coordinator: 2 calls · $0.9100 · 3 tokens',
+    '  - coordinator: unavailable (host_not_proxied)',
+  ])
+  assert.deepEqual(metrics.format_ccxray_devlog_lines(summary, {
+    sessions: [{ session: 'host-1', from: 1000, to: null }],
+    coordinator_unavailable: 'ccxray_too_old',
+  }), [
+    '- ccxray A-012: 2 calls · $0.9100 · tokens in 1 / out 2 / cache 0 (hit 0.0%) / total 3',
+    '  - coordinator: 2 calls · $0.9100 · 3 tokens',
+    '  - coordinator: unavailable (ccxray_too_old)',
+  ])
+})
+
+test('CLI derives coordinator intervals from the configured workspace and keeps worker queries unselected', async () => {
+  const queries = []
+  const { server, endpoint } = await start_server((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`)
+    if (url.pathname === '/_api/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, app: 'ccxray', capabilities: ['task-attribution', 'session-intervals'] }))
+      return
+    }
+    if (url.pathname === '/_api/task-summary') {
+      queries.push(url)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      const sessions = url.searchParams.getAll('session')
+      res.end(JSON.stringify(sessions.length > 0 ? {
+        task: 'A-012',
+        calls: 1,
+        tokens: { input: 1, output: 1, total: 2 },
+        by_role: { coordinator: { calls: 0 } },
+        coordinator: { calls: 0, sessions: [{ session: 'host-1', from: 0, to: 221000, calls: 0 }] },
+      } : {
+        task: 'A-012',
+        role: url.searchParams.get('role') || undefined,
+        calls: 1,
+        tokens: { input: 1, output: 1, total: 2 },
+      }))
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+  const directory = make_temp_dir('agentflow-ccxray-cli-coordinator-')
+  try {
+    const config_path = path.join(directory, 'ag.json')
+    fs.writeFileSync(config_path, JSON.stringify({ switches: { metrics: 'auto', 'workspace-dir': '.agentflow' } }))
+    const log_path = path.join(directory, '.agentflow', '.tmp', 'host-sessions.jsonl')
+    fs.mkdirSync(path.dirname(log_path), { recursive: true })
+    fs.writeFileSync(log_path, [
+      JSON.stringify({ ask: 'A-012', session_id: 'host-1', host: 'codex', ts: 100000, event: 'start' }),
+      JSON.stringify({ ask: 'A-012', session_id: 'host-1', host: 'codex', ts: 101000, event: 'close' }),
+    ].join('\n') + '\n')
+
+    const common = ['ccxray-summary', '--task', 'A-012', '--config', config_path]
+    const coordinator = await run_metrics_cli([...common, '--format', 'devlog'], { CCXRAY_ENDPOINT: endpoint })
+    assert.equal(coordinator.status, 0)
+    assert.match(coordinator.stdout, /coordinator: unavailable \(host_not_proxied\)/)
+    assert.deepEqual(queries[0].searchParams.getAll('session'), ['host-1@0-221000'])
+
+    const worker = await run_metrics_cli([...common, '--role', 'cross-check', '--format', 'json'], { CCXRAY_ENDPOINT: endpoint })
+    assert.equal(worker.status, 0)
+    assert.deepEqual(queries[1].searchParams.getAll('session'), [])
+
+    const skipped = await run_metrics_cli([...common, '--no-coordinator', '--format', 'json'], { CCXRAY_ENDPOINT: endpoint })
+    assert.equal(skipped.status, 0)
+    assert.deepEqual(queries[2].searchParams.getAll('session'), [])
+  } finally {
+    remove_temp_dir(directory)
+    await close_server(server)
+  }
+})
+
 test('CLI emits paste-ready ccxray devlog lines for found, empty, and unreachable tasks', async () => {
   const { server, endpoint } = await start_server((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`)
@@ -320,15 +702,18 @@ test('CLI emits paste-ready ccxray devlog lines for found, empty, and unreachabl
     const found = await run_metrics_cli([...common, '--task', 'TASK-FOUND', '--role', 'cross-check', '--project', 'agentflow'], { CCXRAY_ENDPOINT: endpoint })
     assert.equal(found.status, 0)
     assert.equal(found.stderr, '')
-    assert.equal(found.stdout, '- ccxray TASK-FOUND/cross-check: 3 calls · $0.0421 · tokens in 300 / out 45 / cache 1500 (hit 83.3%) / total 1845 · gpt-5.5 via codex\n')
+    // The CLI stamps the snapshot time it read the figures at (an ISO instant).
+    assert.match(found.stdout, /^- ccxray TASK-FOUND\/cross-check: 3 calls · \$0\.0421 · tokens in 300 \/ out 45 \/ cache 1500 \(hit 83\.3%\) \/ total 1845 · gpt-5\.5 via codex · as of \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\n$/u)
 
     const json_args = ['ccxray-summary', '--config', config_path, '--task', 'TASK-FOUND', '--role', 'cross-check', '--project', 'agentflow']
     const implicit_json = await run_metrics_cli(json_args, { CCXRAY_ENDPOINT: endpoint })
     const explicit_json = await run_metrics_cli([...json_args, '--format', 'json'], { CCXRAY_ENDPOINT: endpoint })
     assert.equal(implicit_json.status, 0)
     assert.equal(explicit_json.status, 0)
-    assert.equal(explicit_json.stdout, implicit_json.stdout)
+    const without_stamp = text => { const parsed = JSON.parse(text); delete parsed.as_of; return parsed }
+    assert.deepEqual(without_stamp(explicit_json.stdout), without_stamp(implicit_json.stdout))
     assert.equal(JSON.parse(implicit_json.stdout).task, 'TASK-FOUND')
+    assert.match(JSON.parse(implicit_json.stdout).as_of, /^\d{4}-\d{2}-\d{2}T/u)
 
     const empty = await run_metrics_cli([...common, '--task', 'TASK-EMPTY'], { CCXRAY_ENDPOINT: endpoint })
     assert.equal(empty.status, 0)
@@ -409,7 +794,7 @@ test('discovers a healthy endpoint from an isolated hub file', async () => {
     assert.deepEqual(await metrics.resolve_ccxray_endpoint({
       env: { CCXRAY_HOME: home },
       probe_endpoint: false,
-    }), { endpoint, reason: null })
+    }), { endpoint, reason: null, capabilities: ['task-attribution'] })
   } finally {
     remove_temp_dir(home)
     await close_server(server)

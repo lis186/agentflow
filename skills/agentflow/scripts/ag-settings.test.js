@@ -691,6 +691,8 @@ test('host detection uses explicit identity or unique host markers, never execut
 	assert.equal(settings.detect_host({ explicit_host: 'codex', env: { CLAUDE_CODE: '1' } }), 'codex')
 	assert.equal(settings.detect_host({ env: { CODEX_SESSION_ID: 'x' } }), 'codex')
 	assert.equal(settings.detect_host({ env: { CLAUDE_CODE: '1' } }), 'claude')
+	assert.equal(settings.detect_host({ env: { CLAUDECODE: '1' } }), 'claude')
+	assert.equal(settings.detect_host({ env: { CLAUDE_CODE_SESSION_ID: 'x' } }), 'claude')
 	assert.throws(() => settings.detect_host({ env: { CODEX_SESSION_ID: 'x', CLAUDE_CODE: '1' } }), /ambiguous/)
 	assert.throws(() => settings.detect_host({ env: {} }), /unknown/)
 	assert.throws(() => settings.detect_host({ env: {}, executables: ['claude', 'codex'] }), /unknown/, 'executable presence is not consulted')

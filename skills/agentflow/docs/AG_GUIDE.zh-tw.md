@@ -201,7 +201,7 @@ away: gates
 
 - `metrics: off|on|auto|ccxray` 控制本機紀錄與 ccxray 遙測：`off` 兩者都停用、`on` 只保留本機紀錄、`auto` 有健康的 ccxray 才選用、`ccxray` 則要求它可用。
 
-外部 worker 的 `telemetry.status` 為 `active` 時，先用含 `--role` 的 `node metrics.js ccxray-summary --task <Ask id> --role <stage> --project <name> --config <ag.json> --format devlog` 輸出原樣貼入 RUN，closeout 前再不含 `--role` 執行一次貼到 Reply；數字只涵蓋外部 worker。
+外部 worker 的 `telemetry.status` 為 `active` 時，先用含 `--role` 的 `node metrics.js ccxray-summary --task <Ask id> --role <stage> --project <name> --config <ag.json> --format devlog` 輸出原樣貼入 RUN，closeout 前再不含 `--role` 執行一次貼到 Reply。host 本身透過 ccxray（`ccxray claude`、`ccxray codex`，或 `ANTHROPIC_BASE_URL` 指向它）時，closeout 總數也包含 coordinator；出現 `host_not_proxied` 行表示 host 繞過了 ccxray。
 
 - `large-work-minutes` 預設為 120，可設為 1–10080，代表流程判斷大型工作的時間門檻。
 

@@ -5,6 +5,7 @@ const node_os = require('node:os')
 const node_path = require('node:path')
 
 const METRICS_HISTORY_NAME = 'metrics-history.jsonl'
+const HOST_SESSION_LOG_NAME = 'host-sessions.jsonl'
 const DEFAULT_WINDOW = 5
 const TOKEN_FIELDS = ['input', 'output', 'cache', 'reasoning', 'total']
 
@@ -75,6 +76,188 @@ const ccxray_mode = config => {
 	return config && (config.switches?.metrics === 'ccxray' || config.switches?.metrics === 'auto')
 		? config.switches.metrics
 		: 'off'
+}
+
+const host_session = (env = process.env) => {
+	const environment = env && typeof env === 'object' ? env : {}
+	const codex_id = nonempty_text(environment.CODEX_THREAD_ID)
+		? String(environment.CODEX_THREAD_ID)
+		: nonempty_text(environment.CODEX_SESSION_ID)
+			? String(environment.CODEX_SESSION_ID)
+			: null
+	if (codex_id !== null) return { host: 'codex', session_id: codex_id }
+	const claude_id = nonempty_text(environment.CLAUDE_CODE_SESSION_ID)
+		? String(environment.CLAUDE_CODE_SESSION_ID)
+		: nonempty_text(environment.CLAUDE_SESSION_ID)
+			? String(environment.CLAUDE_SESSION_ID)
+			: null
+	return claude_id === null ? { host: null, session_id: null } : { host: 'claude', session_id: claude_id }
+}
+
+const workspace_root_for_config = (config_path, workspace) => {
+	const absolute_config = node_path.resolve(config_path)
+	const config_directory = node_path.dirname(absolute_config)
+	let current = config_directory
+	while (true) {
+		const candidate = node_path.resolve(current, workspace)
+		try {
+			if (fs.statSync(candidate).isDirectory()) return current
+		} catch {}
+		const parent = node_path.dirname(current)
+		if (parent === current) break
+		current = parent
+	}
+	const workspace_parts = String(workspace).replace(/\\/gu, '/').split('/').filter(Boolean)
+	const directory_parts = config_directory.split(node_path.sep)
+	for (let index = directory_parts.length - workspace_parts.length; index >= 0; index -= 1) {
+		if (workspace_parts.length > 0 && workspace_parts.every((part, offset) => directory_parts[index + offset] === part)) {
+			return directory_parts.slice(0, index).join(node_path.sep) || node_path.parse(config_directory).root
+		}
+	}
+	return config_directory
+}
+
+const host_session_log_path = (options = {}) => {
+	const config_path = options.config_path || node_path.join(options.repo_root || process.cwd(), 'ag.json')
+	const config = options.config || read_config(config_path)
+	const workspace = config?.switches?.['workspace-dir'] || '.agentflow'
+	const root = options.repo_root
+		? node_path.resolve(options.repo_root)
+		: workspace_root_for_config(config_path, workspace)
+	return node_path.join(node_path.resolve(root, workspace), '.tmp', HOST_SESSION_LOG_NAME)
+}
+
+const config_path_for_touch = options => {
+	if (nonempty_text(options.config_path)) return node_path.resolve(options.config_path)
+	const root = node_path.resolve(options.repo_root || process.cwd())
+	if (nonempty_text(options.notebook_path)) {
+		const relative_notebook = node_path.isAbsolute(options.notebook_path)
+			? node_path.relative(root, options.notebook_path)
+			: options.notebook_path
+		const adjacent = node_path.resolve(root, node_path.dirname(relative_notebook), 'ag.json')
+		if (fs.existsSync(adjacent)) return adjacent
+	}
+	return node_path.join(root, 'ag.json')
+}
+
+const record_host_touch = (options = {}) => {
+	try {
+		const identity = host_session(options.env === undefined ? process.env : options.env)
+		if (identity.session_id === null || !nonempty_text(options.ask) || !nonempty_text(options.event)) return false
+		const config_path = config_path_for_touch(options)
+		const config = options.config || read_config(config_path)
+		if (!['auto', 'ccxray'].includes(ccxray_mode(config))) return false
+		const timestamp = options.ts === undefined ? Date.now() : options.ts
+		if (!Number.isSafeInteger(timestamp) || timestamp < 0) return false
+		const log_path = host_session_log_path({ ...options, config_path, config })
+		fs.mkdirSync(node_path.dirname(log_path), { recursive: true })
+		const record = {
+			ask: String(options.ask),
+			session_id: identity.session_id,
+			host: identity.host,
+			ts: timestamp,
+			event: String(options.event),
+		}
+		fs.appendFileSync(log_path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 })
+		return true
+	} catch {
+		return false
+	}
+}
+
+const read_host_session_records = log_path => {
+	try {
+		return fs.readFileSync(log_path, 'utf8').split(/\r?\n/u).filter(line => line.trim() !== '')
+	} catch {
+		return []
+	}
+}
+
+const parse_host_touch = value => {
+	let record = value
+	if (typeof value === 'string') {
+		try { record = JSON.parse(value) } catch { return null }
+	}
+	if (!is_object(record) || !nonempty_text(record.ask) || !nonempty_text(record.session_id) || !nonempty_text(record.event)) return null
+	if (!Number.isSafeInteger(record.ts) || record.ts < 0) return null
+	return {
+		ask: String(record.ask),
+		session_id: String(record.session_id),
+		ts: record.ts,
+		event: String(record.event),
+	}
+}
+
+const HOST_LEAD_MS = 180000
+const HOST_TAIL_MS = 120000
+const is_close_touch = record => record.event === 'close' || record.event === 'close-round'
+
+// Partition one session's timeline by its touches, in order, so that every
+// instant belongs to at most one Ask (independent review found both a shared
+// boundary millisecond and overlapping spans for interleaved Asks):
+// - a touch owns the time until the next touch;
+// - a close owns at most HOST_TAIL_MS after itself, and the next Ask's first
+//   touch reaches back at most HOST_LEAD_MS; when those two paddings would
+//   meet, the gap is split at its midpoint, and when they would not, the
+//   middle of the gap belongs to nobody (the host was not doing Agentflow work);
+// - an Ask that is interrupted by another Ask's touch before closing hands
+//   over at that touch, with no lead padding for the newcomer;
+// - the very first touch reaches back HOST_LEAD_MS; an unclosed final touch is
+//   open-ended.
+// Intervals are inclusive, so a boundary at B is [.., B - 1] and [B, ..].
+const session_segments = touches => {
+	const segments = []
+	for (let index = 0; index < touches.length; index += 1) {
+		const touch = touches[index]
+		const next = touches[index + 1]
+		const previous = touches[index - 1]
+		let from = touch.ts
+		if (!previous) from = Math.max(0, touch.ts - HOST_LEAD_MS)
+		else if (previous.ask !== touch.ask && is_close_touch(previous)) {
+			const gap = touch.ts - previous.ts
+			from = gap < HOST_LEAD_MS + HOST_TAIL_MS ? previous.ts + Math.floor(gap / 2) : touch.ts - HOST_LEAD_MS
+		}
+		let to = null
+		if (next) {
+			if (next.ask === touch.ask) to = next.ts - 1
+			else if (is_close_touch(touch)) {
+				const gap = next.ts - touch.ts
+				to = (gap < HOST_LEAD_MS + HOST_TAIL_MS ? touch.ts + Math.floor(gap / 2) : touch.ts + HOST_TAIL_MS) - 1
+			} else to = next.ts - 1
+		} else if (is_close_touch(touch)) to = touch.ts + HOST_TAIL_MS
+		if (to !== null && to < from) continue
+		segments.push({ ask: touch.ask, from, to })
+	}
+	return segments
+}
+
+const merge_adjacent = segments => {
+	const merged = []
+	for (const segment of segments) {
+		const last = merged[merged.length - 1]
+		if (last && last.to !== null && segment.from <= last.to + 1) {
+			last.to = segment.to === null ? null : Math.max(last.to, segment.to)
+		} else merged.push({ ...segment })
+	}
+	return merged
+}
+
+const host_session_intervals = (ask, records, _now = Date.now()) => {
+	if (!nonempty_text(ask) || !Array.isArray(records)) return []
+	const valid = records.map(parse_host_touch).filter(record => record !== null)
+	const by_session = new Map()
+	for (const record of valid) {
+		if (!by_session.has(record.session_id)) by_session.set(record.session_id, [])
+		by_session.get(record.session_id).push(record)
+	}
+	const intervals = []
+	for (const [session, session_records] of by_session.entries()) {
+		const touches = session_records.slice().sort((left, right) => left.ts - right.ts)
+		const owned = merge_adjacent(session_segments(touches).filter(segment => segment.ask === String(ask)))
+		for (const segment of owned) intervals.push({ interval: { session, from: segment.from, to: segment.to }, last: segment.to === null ? Number.MAX_SAFE_INTEGER : segment.to })
+	}
+	intervals.sort((left, right) => left.last - right.last)
+	return intervals.slice(-32).map(entry => entry.interval)
 }
 
 const token_value = (value, label) => {
@@ -590,13 +773,14 @@ const probe_http_health = async (endpoint, options = {}) => {
 			headers: { 'Accept': 'application/json' },
 			signal: controller.signal,
 		})
-		if (response.status !== 200) return { healthy: false, reason: 'ccxray_not_found' }
+		if (response.status !== 200) return { healthy: false, reason: 'ccxray_not_found', capabilities: [] }
 		const data = await response.json()
-		if (!data || data.ok !== true || data.app !== 'ccxray') return { healthy: false, reason: 'ccxray_not_found' }
-		if (!Array.isArray(data.capabilities) || !data.capabilities.includes('task-attribution')) return { healthy: false, reason: 'ccxray_too_old' }
-		return { healthy: true, reason: null }
+		const capabilities = Array.isArray(data?.capabilities) ? data.capabilities : []
+		if (!data || data.ok !== true || data.app !== 'ccxray') return { healthy: false, reason: 'ccxray_not_found', capabilities }
+		if (!capabilities.includes('task-attribution')) return { healthy: false, reason: 'ccxray_too_old', capabilities }
+		return { healthy: true, reason: null, capabilities }
 	} catch {
-		return { healthy: false, reason: 'ccxray_not_found' }
+		return { healthy: false, reason: 'ccxray_not_found', capabilities: [] }
 	} finally {
 		clearTimeout(timeout)
 	}
@@ -612,12 +796,17 @@ const check_ccxray_endpoint = async (endpoint, options = {}) => {
 	} catch {
 		return { endpoint: null, reason: 'ccxray_not_found' }
 	}
-	if (result === true) return { endpoint: normalized, reason: null }
-	if (result && result.healthy === true) return { endpoint: normalized, reason: null }
+	if (result === true) return { endpoint: normalized, reason: null, capabilities: [] }
+	if (result && result.healthy === true) return {
+		endpoint: normalized,
+		reason: null,
+		capabilities: Array.isArray(result.capabilities) ? result.capabilities : [],
+	}
 	if (result && result.ok === true && result.app === 'ccxray') {
-		return Array.isArray(result.capabilities) && result.capabilities.includes('task-attribution')
-			? { endpoint: normalized, reason: null }
-			: { endpoint: null, reason: 'ccxray_too_old' }
+		const capabilities = Array.isArray(result.capabilities) ? result.capabilities : []
+		return capabilities.includes('task-attribution')
+			? { endpoint: normalized, reason: null, capabilities }
+			: { endpoint: null, reason: 'ccxray_too_old', capabilities }
 	}
 	return { endpoint: null, reason: result?.reason === 'ccxray_too_old' ? 'ccxray_too_old' : 'ccxray_not_found' }
 }
@@ -639,6 +828,13 @@ const resolve_ccxray_endpoint = async (options = {}) => {
 	return check_ccxray_endpoint(probe_endpoint, options)
 }
 
+const session_spec = value => {
+	if (nonempty_text(value)) return String(value).trim()
+	if (!is_object(value) || !nonempty_text(value.session) || !Number.isSafeInteger(value.from) || value.from < 0) return null
+	if (value.to !== null && value.to !== undefined && (!Number.isSafeInteger(value.to) || value.to < value.from)) return null
+	return `${String(value.session)}@${value.from}-${value.to === null || value.to === undefined ? '' : value.to}`
+}
+
 const fetch_ccxray_metrics = async (task, options = {}) => {
 	if (!nonempty_text(task)) return null
 	const resolution = await resolve_ccxray_endpoint(options)
@@ -646,6 +842,12 @@ const fetch_ccxray_metrics = async (task, options = {}) => {
 	const url = new URL('/_api/task-summary', resolution.endpoint)
 	url.searchParams.set('task', task.trim())
 	for (const key of ['role', 'project']) if (nonempty_text(options[key])) url.searchParams.set(key, String(options[key]).trim())
+	if (Array.isArray(options.sessions) && resolution.capabilities?.includes('session-intervals')) {
+		for (const value of options.sessions.slice(0, 32)) {
+			const spec = session_spec(value)
+			if (spec !== null) url.searchParams.append('session', spec)
+		}
+	}
 
 	const controller = new AbortController()
 	const timeout = setTimeout(() => controller.abort(), options.timeout_ms ?? 3000)
@@ -657,12 +859,12 @@ const fetch_ccxray_metrics = async (task, options = {}) => {
 		})
 		if (response.status !== 200) return null
 		const data = await response.json()
-		if (!data || typeof data !== 'object' || data.calls === 0) return null
+		if (!data || typeof data !== 'object' || data.calls === 0 && !is_object(data.coordinator)) return null
 
 		const token_data = data.tokens && typeof data.tokens === 'object' ? data.tokens : {}
 		const cache_tokens = (token_data.cache_read || 0) + (token_data.cache_create || 0)
 		return {
-			task: data.task,
+			task: data.task ?? task.trim(),
 			role: data.role ?? options.role,
 			project: data.project ?? options.project,
 			calls: data.calls,
@@ -675,6 +877,11 @@ const fetch_ccxray_metrics = async (task, options = {}) => {
 			agents: Array.isArray(data.agents) ? data.agents : [],
 			sessions: data.sessions,
 			by_role: data.by_role && typeof data.by_role === 'object' ? data.by_role : {},
+			cost_confidence: is_object(data.cost_confidence) ? data.cost_confidence : undefined,
+			// The figures are a snapshot: a host that keeps working, or a turn that
+			// finalizes late, changes them. Stamp when they were read.
+			as_of: new Date().toISOString(),
+			...(is_object(data.coordinator) ? { coordinator: data.coordinator } : {}),
 			tokens: {
 				input: token_data.input ?? 'unavailable',
 				output: token_data.output ?? 'unavailable',
@@ -697,6 +904,21 @@ const ccxray_format_cost = value => {
 	return Number.isFinite(numeric) ? numeric.toFixed(4) : 'unavailable'
 }
 
+// ccxray's aggregate-cost rule (its ADR 0017): a total that skipped unpriced or
+// usage-less calls is a lower bound and is marked `+`; one that leans on
+// default rates is marked `~`. An unmarked figure is one we can stand behind.
+const ccxray_cost_marks = confidence => {
+	if (!is_object(confidence)) return { prefix: '', suffix: '' }
+	const under = (Number(confidence.unknown) || 0) + (Number(confidence.no_usage) || 0)
+	const fallback = Number(confidence.fallback) || 0
+	return { prefix: fallback > 0 ? '~' : '', suffix: under > 0 ? '+' : '' }
+}
+
+const ccxray_marked_cost = (value, confidence) => {
+	const marks = ccxray_cost_marks(confidence)
+	return `${marks.prefix}$${ccxray_format_cost(value)}${marks.suffix}`
+}
+
 const ccxray_format_rate = value => {
 	const numeric = typeof value === 'number' ? value : Number(value)
 	return Number.isFinite(numeric) ? `${(numeric * 100).toFixed(1)}%` : 'unavailable'
@@ -715,7 +937,14 @@ const ccxray_format_label = (task, role) => {
 const ccxray_role_total = (role, values = {}) => {
 	const tokens = is_object(values.tokens) ? values.tokens : {}
 	const total_tokens = first_value(tokens, ['total', 'total_tokens']) ?? first_value(values, ['total_tokens', 'tokens_total', 'tokens'])
-	return `  - ${role}: ${ccxray_format_value(first_value(values, ['calls', 'provider_calls']))} calls · $${ccxray_format_cost(first_value(values, ['cost_usd', 'cost']))} · ${ccxray_format_value(total_tokens)} tokens`
+	return `  - ${role}: ${ccxray_format_value(first_value(values, ['calls', 'provider_calls']))} calls · ${ccxray_marked_cost(first_value(values, ['cost_usd', 'cost']), values.cost_confidence)} · ${ccxray_format_value(total_tokens)} tokens`
+}
+
+const coordinator_unavailable_line = options => {
+	const values = is_object(options) ? options : {}
+	const known_sessions = Array.isArray(values.sessions) && values.sessions.length > 0
+	const reason = values.coordinator_unavailable || (values.coordinator_capability === false && known_sessions ? 'ccxray_too_old' : null)
+	return known_sessions && nonempty_text(reason) ? `  - coordinator: unavailable (${reason})` : null
 }
 
 const format_ccxray_devlog_lines = (summary, options = {}) => {
@@ -723,6 +952,8 @@ const format_ccxray_devlog_lines = (summary, options = {}) => {
 	const unavailable = option_values.unavailable
 	if (is_object(unavailable)) {
 		const lines = [`- ccxray ${ccxray_format_label(unavailable.task, unavailable.role)}: unavailable (${ccxray_format_value(unavailable.reason)})`]
+		const coordinator_line = coordinator_unavailable_line(option_values)
+		if (coordinator_line) lines.push(coordinator_line)
 		if (nonempty_text(unavailable.guidance)) {
 			for (const line of String(unavailable.guidance).split(/\r?\n/u)) {
 				if (line.trim() !== '') lines.push(`  - ${line.trim()}`)
@@ -743,15 +974,38 @@ const format_ccxray_devlog_lines = (summary, options = {}) => {
 			: agents !== ''
 				? ` · ${agents}`
 				: ''
+	const as_of = nonempty_text(summary.as_of) ? ` · as of ${String(summary.as_of).trim()}` : ''
 	const lines = [
-		`- ccxray ${ccxray_format_label(summary.task, role)}: ${ccxray_format_value(summary.calls)} calls · $${ccxray_format_cost(summary.cost_usd)} · tokens in ${ccxray_format_value(tokens.input)} / out ${ccxray_format_value(tokens.output)} / cache ${ccxray_format_value(tokens.cache)} (hit ${ccxray_format_rate(summary.cache_hit_rate)}) / total ${ccxray_format_value(tokens.total)}${attribution}`,
+		`- ccxray ${ccxray_format_label(summary.task, role)}: ${ccxray_format_value(summary.calls)} calls · ${ccxray_marked_cost(summary.cost_usd, summary.cost_confidence)} · tokens in ${ccxray_format_value(tokens.input)} / out ${ccxray_format_value(tokens.output)} / cache ${ccxray_format_value(tokens.cache)} (hit ${ccxray_format_rate(summary.cache_hit_rate)}) / total ${ccxray_format_value(tokens.total)}${attribution}${as_of}`,
 	]
+	if (is_object(summary.cost_confidence)) {
+		const unknown = Number(summary.cost_confidence.unknown) || 0
+		const no_usage = Number(summary.cost_confidence.no_usage) || 0
+		const fallback = Number(summary.cost_confidence.fallback) || 0
+		const notes = []
+		if (unknown > 0) notes.push(`${unknown} not priced (unknown model)`)
+		if (no_usage > 0) notes.push(`${no_usage} without usage`)
+		if (fallback > 0) notes.push(`${fallback} at default rates`)
+		if (notes.length > 0) lines.push(`  - cost is a lower bound: ${notes.join('; ')}`)
+	}
 
-	const by_role = is_object(summary.by_role) ? summary.by_role : {}
-	if (!role && Object.keys(by_role).length >= 2) {
-		for (const role_name of Object.keys(by_role).sort((left, right) => left < right ? -1 : left > right ? 1 : 0)) {
+	const by_role = is_object(summary.by_role) ? { ...summary.by_role } : {}
+	if (!Object.hasOwn(by_role, 'coordinator') && is_object(summary.coordinator)) by_role.coordinator = summary.coordinator
+	const role_names = Object.keys(by_role)
+	if ((!role || role === 'coordinator') && (role_names.length >= 2 || role_names.length === 1 && role_names[0] === 'coordinator')) {
+		for (const role_name of role_names.sort((left, right) => left < right ? -1 : left > right ? 1 : 0)) {
 			lines.push(ccxray_role_total(role_name, is_object(by_role[role_name]) ? by_role[role_name] : {}))
 		}
+	}
+
+	const coordinator_sessions = is_object(summary.coordinator) && Array.isArray(summary.coordinator.sessions)
+		? summary.coordinator.sessions
+		: []
+	if (coordinator_sessions.length > 0 && summary.coordinator.calls === 0) {
+		lines.push('  - coordinator: unavailable (host_not_proxied)')
+	} else {
+		const coordinator_line = coordinator_unavailable_line(option_values)
+		if (coordinator_line) lines.push(coordinator_line)
 	}
 
 	const tools = is_object(summary.tools) ? summary.tools : {}
@@ -827,8 +1081,13 @@ const parse_cli = argv => {
 		let project
 		let config_path
 		let format
+		let no_coordinator = false
 		for (let index = 1; index < argv.length; index += 1) {
 			const argument = argv[index]
+			if (argument === '--no-coordinator') {
+				no_coordinator = true
+				continue
+			}
 			if (argument === '--task' || argument === '--role' || argument === '--project' || argument === '--config' || argument === '--ag-json' || argument === '--format') {
 				if (index + 1 >= argv.length) throw new MetricsError(`${argument} requires a value`)
 				const value = argv[++index]
@@ -844,7 +1103,7 @@ const parse_cli = argv => {
 			else if (typeof argument === 'string' && argument.startsWith('--format=')) format = argument.slice('--format='.length)
 		}
 		if (!nonempty_text(task)) throw new MetricsError('ccxray-summary requires --task <id>')
-		return { subcommand: 'ccxray-summary', task, role, project, config_path, format }
+		return { subcommand: 'ccxray-summary', task, role, project, config_path, format, no_coordinator }
 	}
 
 	let history_path
@@ -883,7 +1142,7 @@ const parse_cli = argv => {
 const write_ccxray_output = (format, summary, unavailable, options = {}) => {
 	if (format === 'devlog') {
 		const unavailable_options = unavailable
-			? { unavailable: { ...unavailable, task: unavailable.task ?? options.task, role: unavailable.role ?? options.role } }
+			? { ...options, unavailable: { ...unavailable, task: unavailable.task ?? options.task, role: unavailable.role ?? options.role } }
 			: options
 		const lines = format_ccxray_devlog_lines(summary, unavailable_options)
 		process.stdout.write(`${lines.join('\n')}\n`)
@@ -918,17 +1177,37 @@ const main = async argv => {
 				})
 				return 0
 			}
+			const coordinator_enabled = !options.no_coordinator && (!nonempty_text(options.role) || options.role === 'coordinator')
+			let coordinator_sessions = []
+			if (coordinator_enabled && options.config_path) {
+				try {
+					const log_path = host_session_log_path({ config_path: options.config_path })
+					coordinator_sessions = host_session_intervals(options.task, read_host_session_records(log_path), Date.now())
+				} catch {}
+			}
 			const resolution = await resolve_ccxray_endpoint(options)
+			const coordinator_capable = resolution.capabilities?.includes('session-intervals') === true
 			const result = resolution.endpoint
-				? await fetch_ccxray_metrics(options.task, { ...options, endpoint: resolution.endpoint })
+				? await fetch_ccxray_metrics(options.task, { ...options, endpoint: resolution.endpoint, sessions: coordinator_sessions })
 				: null
-			if (result) write_ccxray_output(format, result, null, { role: options.role })
+			const coordinator_unavailable = coordinator_sessions.length > 0 && !coordinator_capable && resolution.endpoint
+				? 'ccxray_too_old'
+				: null
+			if (result) write_ccxray_output(format, result, null, {
+				role: options.role,
+				sessions: coordinator_sessions,
+				coordinator_unavailable,
+			})
 			else {
 				const unavailable = { available: false, reason: resolution.endpoint ? 'no_data' : resolution.reason }
 				if (mode === 'ccxray' && !resolution.endpoint) unavailable.guidance = ccxray_install_guidance({ reason: unavailable.reason })
 				write_ccxray_output(format, null, unavailable, {
 					task: options.task,
 					role: options.role,
+					sessions: coordinator_sessions,
+					coordinator_unavailable: resolution.reason === 'ccxray_too_old' || coordinator_unavailable
+						? 'ccxray_too_old'
+						: null,
 				})
 			}
 			return 0
@@ -947,6 +1226,7 @@ if (require.main === module) main(process.argv.slice(2)).then(code => { process.
 
 module.exports = {
 	DEFAULT_WINDOW,
+	HOST_SESSION_LOG_NAME,
 	METRICS_HISTORY_NAME,
 	MetricsError,
 	append_metrics_history,
@@ -965,6 +1245,11 @@ module.exports = {
 	main,
 	metrics_enabled,
 	ccxray_mode,
+	host_session,
+	host_session_log_path,
+	read_host_session_records,
+	record_host_touch,
+	host_session_intervals,
 	build_ccxray_attribution_prefix,
 	ccxray_install_guidance,
 	ccxray_executable_available,

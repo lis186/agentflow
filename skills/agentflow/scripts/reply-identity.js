@@ -7,7 +7,7 @@ const path = require('node:path');
 // Only the active session's current turn is evidence. Configuration is never read.
 const detect_reply_identity = ({ root = process.cwd(), env = process.env } = {}) => {
   const ids = [env.CODEX_THREAD_ID, env.CODEX_SESSION_ID].filter(Boolean);
-  const host = ids.length ? 'codex' : env.CLAUDE_SESSION_ID || env.CLAUDE_CODE ? 'claude' : 'host';
+  const host = ids.length ? 'codex' : env.CLAUDE_CODE_SESSION_ID || env.CLAUDE_SESSION_ID || env.CLAUDE_CODE || env.CLAUDECODE ? 'claude' : 'host';
   const unknown = `${host}/unknown`;
   if (host !== 'codex' || new Set(ids).size !== 1 || !/^[a-f0-9-]{36}$/iu.test(ids[0])) return unknown;
   try {

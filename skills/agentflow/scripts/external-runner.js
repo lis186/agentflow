@@ -282,7 +282,7 @@ const activity_file_identity = file_path => {
 
 const host_markers = Object.freeze({
   codex: ['CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_CI', 'CODEX_SANDBOX', 'CODEX_CLI'],
-  claude: ['CLAUDE_PROJECT_DIR', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CLI'],
+  claude: ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PROJECT_DIR', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CLI'],
 })
 
 const telemetry_value = value => {
@@ -325,7 +325,20 @@ const inherited_base_url = (inherited, endpoint, prefix, suffix = '') => {
   return `${render_base_url(parsed, pathname)}${prefix}${suffix}${parsed.search}${parsed.hash}`
 }
 
-const codex_subcommands = new Set(['exec', 'e', 'review'])
+// Every codex subcommand that reaches a model and accepts `-c` (checked against
+// `codex <sub> --help`). `app` is left out on purpose: the desktop launcher's
+// root-level form is the verified one.
+const codex_subcommands = new Set(['exec', 'e', 'review', 'resume', 'fork', 'apply', 'a'])
+
+// Root options that consume the next token (`codex --help`), so that token is
+// never mistaken for a subcommand or a prompt. Found in independent review:
+// with `-a never exec -c x=1` the old partial list stopped at `never`, put the
+// overrides at root level, and codex dropped them again.
+const codex_root_value_options = new Set([
+  '-c', '--config', '--enable', '--disable', '--remote', '--remote-auth-token-env',
+  '-i', '--image', '-m', '--model', '--local-provider', '-p', '--profile',
+  '-s', '--sandbox', '-C', '--cd', '--add-dir', '-a', '--ask-for-approval',
+])
 
 // Index at which config overrides must be inserted: right after the first
 // subcommand token, or 0 when the command has none (interactive use).
@@ -336,10 +349,15 @@ const codex_override_index = args => {
     if (typeof argument !== 'string') return 0
     if (codex_subcommands.has(argument)) return index + 1
     if (!argument.startsWith('-')) return 0
-    if ((argument === '-c' || argument === '--config' || argument === '-m' || argument === '--model' || argument === '-p' || argument === '--profile' || argument === '-C' || argument === '--cd' || argument === '-s' || argument === '--sandbox') && !argument.includes('=')) index += 1
+    if (codex_root_value_options.has(argument)) index += 1 // `--opt=value` is one token
   }
   return 0
 }
+
+// A codex argument that already routes the model somewhere: `-c key=value`,
+// `--config key=value`, or the joined `--config=key=value` spelling.
+const codex_base_url_override = argument => typeof argument === 'string'
+  && /^(?:--config=)?(?:openai_base_url|chatgpt_base_url)\s*=/u.test(argument)
 
 const apply_injection_args = (args, injection) => {
   const prefixed = [...(injection?.arg_prefix || []), ...args]
@@ -363,7 +381,11 @@ const ccxray_worker_injection = (command, environment, { task, role, project, en
   if (!['claude', 'codex', 'grok'].includes(executable)) return { status: 'skipped', reason: 'unsupported_executable', env_updates, arg_prefix: [] }
 
   if (executable === 'codex') {
-    const custom_base = args.some(argument => typeof argument === 'string' && /^(?:openai_base_url|chatgpt_base_url)\s*=/u.test(argument))
+    // Same no-override rule as claude/grok: a foreign gateway in the inherited
+    // environment, or a routing override already in the arguments, wins.
+    const inherited_env = environment && typeof environment === 'object' ? environment : {}
+    const foreign_env = ['OPENAI_BASE_URL', 'CHATGPT_BASE_URL'].some(name => inherited_env[name] && !same_endpoint_origin(inherited_env[name], endpoint_value))
+    const custom_base = foreign_env || args.some(codex_base_url_override)
     if (custom_base) return { status: 'skipped', reason: 'custom_base_url', env_updates, arg_prefix: [] }
     const base_url = `${endpoint_value}${prefix}/v1`
     // Codex drops root-level `-c` overrides as soon as the subcommand carries its

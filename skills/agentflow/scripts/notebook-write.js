@@ -8,6 +8,7 @@ const { spawnSync } = require('node:child_process');
 const { TextDecoder } = require('node:util');
 const { lint_round_boundaries, parse_devlog, record_heading_has_valid_local_timestamp } = require('./round-linter');
 const ag_settings = require('./ag-settings');
+const { record_host_touch } = require('./metrics.js');
 const { format_local_timestamp } = require('./local-time.js');
 
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -526,6 +527,7 @@ const close_round = ({ root = process.cwd(), notebook: notebook_path, input } = 
   }
 
   const replaced = read_regular_file(notebook_file, 'notebook');
+  record_host_touch({ repo_root: repository_root, notebook_path, ask: prepared.ask, event: 'close-round' });
   return { notebook: notebook_path, ask: prepared.ask, runs_inserted: prepared.runs.length, reply_inserted: true, status_replaced: true, next_ask: prepared.next_ask, identity: replaced.identity };
 };
 
@@ -801,6 +803,7 @@ const append_wip = ({ root = process.cwd(), notebook: notebook_path, ask, input:
     }
   }
 
+  record_host_touch({ repo_root: repository_root, notebook_path, ask, event: 'append-wip' });
   return { notebook: notebook_path, ask, input: input_stdin ? 'stdin' : draft_path };
 };
 
@@ -833,6 +836,7 @@ const append_run = ({ root = process.cwd(), notebook: notebook_path, ask, input:
       try { node_fs.closeSync(lock_descriptor); } finally { remove_if_present(lock_path); }
     }
   }
+  record_host_touch({ repo_root: repository_root, notebook_path, ask, event: 'append-run' });
   return { notebook: notebook_path, ask, input: input_stdin ? 'stdin' : draft_path };
 };
 
@@ -900,6 +904,7 @@ const append_reply = ({ root = process.cwd(), notebook: notebook_path, ask, inpu
     }
   }
 
+  record_host_touch({ repo_root: repository_root, notebook_path, ask, event: 'append-reply' });
   return { notebook: notebook_path, ask, input: input_stdin ? 'stdin' : draft_path };
 };
 
