@@ -201,7 +201,9 @@ Type `settings` to see the active values and available choices. To change one, s
 
 - `ask-names: on|off` adds the asker’s name to new Ask headings or leaves it off.
 
-- `metrics: on|off` enables optional local timing and model records. These are not a quality score.
+- `metrics: off|on|auto|ccxray` controls local records and ccxray telemetry: `off` disables both, `on` keeps local records, `auto` uses healthy ccxray optionally, and `ccxray` requires it.
+
+For an active external worker, run `node metrics.js ccxray-summary --task <Ask id> --role <stage> --project <name> --config <ag.json> --format devlog` for its RUN, then run it without `--role` before closeout for the Reply, and paste both outputs verbatim; these figures cover external workers only.
 
 - `large-work-minutes` defaults to 120; valid values are 1–10080. It sets the workflow’s large-work time threshold.
 

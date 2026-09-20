@@ -2,6 +2,12 @@
 
 Notable Agentflow changes, with the newest version first. Release metadata uses major.minor.patch; v8.2 is version 8.2.0. Earlier dates identify recorded source milestones, not independently verified public publication dates.
 
+## [Unreleased]
+
+### Added
+
+- Optional ccxray telemetry attribution and per-stage cost and token enrichment for external Claude, Codex, and Grok workers.
+
 ## [8.2.0] — 2026-09-13
 
 ### Added
