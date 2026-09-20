@@ -442,12 +442,32 @@ const select_profile = (config, options = {}) => {
 
 const no_eligible_profile_error = cli_provider => new SettingsError(`No eligible external-worker profile: no configured profile has an available executable compatible with cli-provider '${cli_provider}'.`, { code: 'AG_DISPATCH_NO_PROFILE' })
 
+// A ccxray started through npx, or from a checkout, is never on PATH. A declared
+// CCXRAY_ENDPOINT or a live hub lockfile is evidence that one is in use, so the
+// install warning would be a false alarm. Synchronous evidence only: settings
+// validation must not make a network call. Required lazily: metrics.js is a
+// leaf module today and this keeps a future import of settings there cycle-free.
+const ccxray_endpoint_declared = options => {
+	try {
+		const { detect_ccxray_endpoint } = require('./metrics.js')
+		return Boolean(detect_ccxray_endpoint({ env: options.env === undefined ? process.env : options.env }))
+	} catch {
+		return false
+	}
+}
+
 const environment_validation = (config, options = {}, warnings = [], errors = []) => {
 	if (options.check_executables === false) return { availability: {} }
 
 	const availability = executable_availability(options)
 	const provider = config && config.switches && config.switches['cli-provider']
 	const active_host = options.active_host || options.explicit_host || options.coordinator_host || ''
+	const executable_check = typeof options.executable_available === 'function'
+		? options.executable_available
+		: command => executable_available(command, options)
+	if (config && config.switches && config.switches.metrics === 'ccxray' && !executable_check('ccxray') && !ccxray_endpoint_declared(options)) {
+		warnings.push('warning: metrics=ccxray but the ccxray executable is not installed; run: npm install -g ccxray (or set metrics: auto)')
+	}
 	if (provider === 'off') {
 		const dormant = opposite_host(active_host)
 		if (dormant && !availability[dormant]) warnings.push(`warning: the dormant ${dormant} executable is unavailable; current cli-provider=off does not require it`)
@@ -1725,7 +1745,7 @@ const format_settings_display = (config, options = {}) => {
 		'- streams: ask, always, or off; use streams: <value>',
 		'- ask-names: on or off; use ask-names: <value>',
 		'- allow-ag: on, off, or ask; use allow-ag: <value>',
-		'- metrics: off, on, ccxray, or auto; use metrics: <value>',
+		'- metrics: off (none), on (local), auto (optional ccxray), or ccxray (required); use metrics: <value>',
 		'- large-work-minutes: integer from 1 through 10080; use large-work-minutes: <value>',
 		'- completion-cleanup: off or on; use completion-cleanup: <value>',
 		'- completion-cleanup-interval-days: integer from 1 through 365; use completion-cleanup-interval-days: <value>',

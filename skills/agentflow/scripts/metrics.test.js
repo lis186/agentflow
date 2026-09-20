@@ -340,3 +340,77 @@ test('CLI reads the applicable history and honors the requested window', () => {
 		dispose(root)
 	}
 })
+
+const make_ccxray_summary = overrides => ({
+	task: 'A-012',
+	calls: 3,
+	cost_usd: 0.0421,
+	cache_hit_rate: 0.833,
+	tokens: { input: 300, output: 45, cache: 1500, reasoning: 20, total: 1845 },
+	tools: {},
+	tool_failures: 0,
+	skills: {},
+	models: [],
+	agents: [],
+	by_role: {},
+	...overrides,
+})
+
+test('formats a role-filtered ccxray summary with model and agent attribution', () => {
+	assert.deepEqual(metrics.format_ccxray_devlog_lines(make_ccxray_summary({
+		models: ['gpt-5.5'],
+		agents: ['codex'],
+		by_role: {
+			'cross-check': { calls: 2, cost_usd: 0.03, tokens: { total: 1200 } },
+			implementation: { calls: 1, cost_usd: 0.0121, tokens: { total: 645 } },
+		},
+	}), { role: 'cross-check' }), [
+		'- ccxray A-012/cross-check: 3 calls · $0.0421 · tokens in 300 / out 45 / cache 1500 (hit 83.3%) / total 1845 · gpt-5.5 via codex',
+	])
+})
+
+test('formats unfiltered role totals and tools in stable sorted order', () => {
+	assert.deepEqual(metrics.format_ccxray_devlog_lines(make_ccxray_summary({
+		models: ['gpt-5.5'],
+		agents: ['codex'],
+		tools: { Edit: 1, Bash: 2 },
+		tool_failures: 1,
+		by_role: {
+			implementation: { calls: 1, cost_usd: 0.0121, tokens: { total: 645 } },
+			'cross-check': { calls: 2, cost_usd: 0.03, tokens: { total: 1200 } },
+		},
+	})), [
+		'- ccxray A-012: 3 calls · $0.0421 · tokens in 300 / out 45 / cache 1500 (hit 83.3%) / total 1845 · gpt-5.5 via codex',
+		'  - cross-check: 2 calls · $0.0300 · 1200 tokens',
+		'  - implementation: 1 calls · $0.0121 · 645 tokens',
+		'  - tools: Bash x2, Edit x1; failures: 1',
+	])
+})
+
+test('formats empty model and agent lists and omits zero tool failures', () => {
+	assert.deepEqual(metrics.format_ccxray_devlog_lines(make_ccxray_summary({
+		tools: { Edit: 1, Bash: 2 },
+	})), [
+		'- ccxray A-012: 3 calls · $0.0421 · tokens in 300 / out 45 / cache 1500 (hit 83.3%) / total 1845',
+		'  - tools: Bash x2, Edit x1',
+	])
+	assert.match(metrics.format_ccxray_devlog_lines(make_ccxray_summary({ models: ['gpt-5.5'] }))[0], /· gpt-5\.5$/)
+	assert.match(metrics.format_ccxray_devlog_lines(make_ccxray_summary({ agents: ['codex'] }))[0], /· codex$/)
+})
+
+test('formats unavailable ccxray results with optional guidance and accepts empty input', () => {
+	assert.deepEqual(metrics.format_ccxray_devlog_lines(null, {
+		unavailable: { task: 'A-012', role: 'cross-check', reason: 'ccxray_not_found' },
+	}), [
+		'- ccxray A-012/cross-check: unavailable (ccxray_not_found)',
+	])
+	assert.deepEqual(metrics.format_ccxray_devlog_lines(undefined, {
+		unavailable: { task: 'A-012', reason: 'no_data', guidance: ['Start ccxray.', 'Retry the command.'].join('\n') },
+	}), [
+		'- ccxray A-012: unavailable (no_data)',
+		'  - Start ccxray.',
+		'  - Retry the command.',
+	])
+	assert.deepEqual(metrics.format_ccxray_devlog_lines(), [])
+	assert.deepEqual(metrics.format_ccxray_devlog_lines(null), [])
+})

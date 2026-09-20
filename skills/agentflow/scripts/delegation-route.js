@@ -105,6 +105,7 @@ const launch_threeways_debate = async (facts, dependencies = {}) => {
 		return { ...plan, valid: false, error: 'threeways runner command must be derived only from the selected better-tier worker' }
 	}
 	const runner_options = { ...facts.runner_options, command: [worker.executable, ...worker.args, ...facts.runner_arguments] }
+	if (!Object.hasOwn(facts.runner_options, 'role')) runner_options.role = plan.stage_id
 	const result = await run_external_command(runner_options)
 	return { ...plan, worker, runner_id: 'external-runner-v1', runner: result }
 }
