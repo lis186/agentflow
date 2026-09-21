@@ -199,7 +199,9 @@ away: gates
 
 - `ask-names: on|off` 控制是否在新的 Ask 標題加上提問者姓名。
 
-- `metrics: on|off` 控制是否留下本機耗時與模型紀錄。這些紀錄不是品質評分。
+- `metrics: off|on|auto|ccxray` 控制本機紀錄與 ccxray 遙測：`off` 兩者都停用、`on` 只保留本機紀錄、`auto` 有健康的 ccxray 才選用、`ccxray` 則要求它可用。
+
+ccxray 成本回報請在每次 worker attempt 結束後執行 `ccxray-summary --attempt --task <Ask> --role <stage> --config <ag.json> --format devlog`，closeout 時執行 `--cumulative`，將輸出原樣貼上，並把 `.agentflow/evidence/ccxray/` 下的 receipts 視為稽核紀錄；所有數字都是依記錄費率建模，不是發票數字。
 
 - `large-work-minutes` 預設為 120，可設為 1–10080，代表流程判斷大型工作的時間門檻。
 

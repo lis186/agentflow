@@ -102,6 +102,89 @@ node_test.test('external runner returns text', async () => {
   }
 })
 
+node_test.test('external runner records one attempt touch with the requested attempt and outcome', async () => {
+  const source = make_source_repo()
+  const disposable = make_temp_dir('agentflow-external-runner-attempt-')
+  const config_path = node_path.join(source, 'ag.json')
+  node_fs.writeFileSync(config_path, JSON.stringify({ switches: { metrics: 'auto', 'workspace-dir': '.agentflow' } }))
+  try {
+    const result = await runner.run_external_command(make_run_options(source, disposable, 'text', {
+      task: 'A-012',
+      role: 'cross-check',
+      project: 'agentflow',
+      attempt: 3,
+      config_path,
+      repo_root: source,
+      env: { CODEX_THREAD_ID: 'host-session' },
+      touch_env: { CODEX_THREAD_ID: 'host-session' },
+    }))
+    node_assert.equal(result.status, 'completed')
+    const log_path = node_path.join(source, '.agentflow', '.tmp', 'host-sessions.jsonl')
+    const records = node_fs.readFileSync(log_path, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    node_assert.deepEqual(records.map(record => ({ ask: record.ask, session_id: record.session_id, host: record.host, event: record.event, role: record.role, project: record.project, attempt: record.attempt, outcome: record.outcome })), [
+      { ask: 'A-012', session_id: 'host-session', host: 'codex', event: 'attempt', role: 'cross-check', project: 'agentflow', attempt: 3, outcome: 'succeeded' },
+    ])
+    node_assert.equal(Number.isSafeInteger(records[0].started_ms), true)
+    node_assert.equal(Number.isSafeInteger(records[0].ended_ms), true)
+    node_assert.equal(records[0].ended_ms >= records[0].started_ms, true)
+  } finally {
+    remove_temp_dir(source)
+    remove_temp_dir(disposable)
+  }
+})
+
+node_test.test('external runner does not create telemetry under an unconfigured source or cwd', async () => {
+  const source = make_source_repo()
+  const disposable = make_temp_dir('agentflow-external-runner-no-config-')
+  const cwd = make_temp_dir('agentflow-external-runner-cwd-')
+  const original_cwd = process.cwd()
+  try {
+    process.chdir(cwd)
+    const result = await runner.run_external_command(make_run_options(source, disposable, 'text', {
+      task: 'A-NO-CONFIG',
+      role: 'review',
+      metrics: 'ccxray',
+      ccxray_endpoint: 'http://127.0.0.1:1',
+      touch_env: { CODEX_THREAD_ID: 'test-host' },
+    }))
+    node_assert.equal(result.status, 'completed')
+    node_assert.equal(node_fs.existsSync(node_path.join(source, '.agentflow')), false)
+    node_assert.equal(node_fs.existsSync(node_path.join(cwd, '.agentflow')), false)
+  } finally {
+    process.chdir(original_cwd)
+    remove_temp_dir(source)
+    remove_temp_dir(disposable)
+    remove_temp_dir(cwd)
+  }
+})
+
+node_test.test('external runner records telemetry under source_directory when config_path is omitted', async () => {
+  const source = make_source_repo()
+  const disposable = make_temp_dir('agentflow-external-runner-source-config-')
+  const cwd = make_temp_dir('agentflow-external-runner-source-cwd-')
+  const original_cwd = process.cwd()
+  node_fs.writeFileSync(node_path.join(source, 'ag.json'), JSON.stringify({ switches: { metrics: 'auto', 'workspace-dir': '.agentflow' } }))
+  try {
+    process.chdir(cwd)
+    const result = await runner.run_external_command(make_run_options(source, disposable, 'text', {
+      task: 'A-SOURCE-CONFIG',
+      role: 'review',
+      metrics: 'auto',
+      touch_env: { CODEX_THREAD_ID: 'source-host' },
+    }))
+    node_assert.equal(result.status, 'completed')
+    const log_path = node_path.join(source, '.agentflow', '.tmp', 'host-sessions.jsonl')
+    node_assert.equal(node_fs.existsSync(log_path), true)
+    node_assert.match(node_fs.readFileSync(log_path, 'utf8'), /"session_id":"source-host"/u)
+    node_assert.equal(node_fs.existsSync(node_path.join(cwd, '.agentflow')), false)
+  } finally {
+    process.chdir(original_cwd)
+    remove_temp_dir(source)
+    remove_temp_dir(disposable)
+    remove_temp_dir(cwd)
+  }
+})
+
 node_test.test('external runner keeps command arguments literal', async () => {
   const source = make_source_repo()
   const disposable = make_temp_dir('agentflow-external-runner-args-')
@@ -137,7 +220,7 @@ node_test.test('external runner gives the fake worker an already-closed standard
 })
 
 node_test.test('external runner removes only opposite-host markers for provider workers', async () => {
-  const marker_names = ['CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_CI', 'CODEX_SANDBOX', 'CODEX_CLI', 'CLAUDE_PROJECT_DIR', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CLI', 'NEUTRAL_VALUE']
+  const marker_names = ['CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_CI', 'CODEX_SANDBOX', 'CODEX_CLI', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PROJECT_DIR', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CLI', 'NEUTRAL_VALUE']
   const supplied_env = Object.fromEntries(marker_names.map(name => [name, `${name}-value`]))
 
   for (const provider of ['claude', 'codex']) {

@@ -94,10 +94,27 @@ test('threeways launches only through the supplied unified external runner and c
 	assert.equal(result.stage_id, 'threeways')
 	assert.equal(result.worker.tier, 'better')
 	assert.equal(result.runner_id, 'external-runner-v1')
-	assert.deepEqual(calls, [{ source_directory: '/repo', command: ['codex', '--safe', 'exec', 'review'] }])
+	assert.deepEqual(calls, [{ source_directory: '/repo', command: ['codex', '--safe', 'exec', 'review'], role: 'threeways', attempt: 1 }])
 	const no_launch = await route.launch_threeways_debate({ ask_text: 'threeways', work_root: '.agentflow/artifacts/A-001-plan', worker_starts: 3 }, {})
 	assert.equal(no_launch.permits_launch, false)
 	assert.equal(no_launch.consensus, 'UNRESOLVED')
+})
+
+test('threeways forwards caller telemetry options and defaults the role only when absent', async () => {
+	const calls = []
+	await route.launch_threeways_debate({
+		ask_text: '3ways', work_root: '.agentflow/artifacts/A-001-plan', worker_starts: 0,
+		worker_selection: { active_host: 'codex' }, runner_options: {
+			source_directory: '/repo', task: 'A-012', project: 'ipadpos', metrics: 'auto', config_path: 'ag.json', touch_env: {},
+		}, runner_arguments: ['exec', 'review']
+	}, {
+		resolve_worker: () => ({ tier: 'better', executable: 'codex', args: [] }),
+		run_external_command: async options => { calls.push(options); return { process: { exit_code: 0 } } },
+	})
+	assert.deepEqual(calls, [{
+		source_directory: '/repo', task: 'A-012', project: 'ipadpos', metrics: 'auto', config_path: 'ag.json', touch_env: {},
+		command: ['codex', 'exec', 'review'], role: 'threeways', attempt: 1,
+	}])
 })
 
 test('threeways default path binds the imported worker resolver to the imported unified runner command', async () => {
@@ -112,7 +129,7 @@ test('threeways default path binds the imported worker resolver to the imported 
 			config: { approved: true }, worker_selection: { active_host: 'codex' }, runner_options: { source_directory: '/repo' }, runner_arguments: ['exec', 'review']
 		})
 		assert.equal(result.worker.executable, 'brain-two')
-		assert.deepEqual(calls, [{ source_directory: '/repo', command: ['brain-two', '--profile', 'better', 'exec', 'review'] }])
+		assert.deepEqual(calls, [{ source_directory: '/repo', command: ['brain-two', '--profile', 'better', 'exec', 'review'], role: 'threeways', attempt: 1 }])
 	} finally {
 		settings.resolve_threeways_worker = original_resolver
 		external_runner.run_external_command = original_runner
@@ -136,7 +153,7 @@ test('threeways executes one immutable brief-report-resolution journey through t
 	})
 	assert.equal(result.consensus, 'AGREE')
 	assert.equal(result.retry_required, false)
-	assert.deepEqual(calls, [{ source_directory: '/repo', command: ['brain-two', '--review', 'exec', 'review'] }])
+	assert.deepEqual(calls, [{ source_directory: '/repo', command: ['brain-two', '--review', 'exec', 'review'], role: 'threeways', attempt: 1 }])
 	const artifact_root = path.join(repo_root, '.agentflow/artifacts/A-001-plan')
 	assert.match(fs.readFileSync(path.join(artifact_root, 'threeways-brief-r1.md'), 'utf8'), /Normal journey/)
 	assert.match(fs.readFileSync(path.join(artifact_root, 'threeways-report-r1.md'), 'utf8'), /^\* _2026/m)

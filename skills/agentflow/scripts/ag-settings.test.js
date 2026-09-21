@@ -342,7 +342,7 @@ test('exposes allow-ag and metrics in display and public changes', () => {
 	assert.match(display, /- allow-ag: on/)
 	assert.match(display, /- metrics: off/)
 	assert.match(display, /allow-ag: on, off, or ask; use allow-ag: <value>/)
-	assert.match(display, /metrics: off or on; use metrics: <value>/)
+	assert.match(display, /metrics: off \(none\), on \(local\), auto \(optional ccxray\), or ccxray \(required\); use metrics: <value>/)
 
 	const changed = settings.apply_changes(config, ['allow-ag: ask', 'metrics: on'], { active_host: 'codex', ...all_executables })
 	assert.equal(changed.config.switches['allow-ag'], 'ask')
@@ -691,6 +691,8 @@ test('host detection uses explicit identity or unique host markers, never execut
 	assert.equal(settings.detect_host({ explicit_host: 'codex', env: { CLAUDE_CODE: '1' } }), 'codex')
 	assert.equal(settings.detect_host({ env: { CODEX_SESSION_ID: 'x' } }), 'codex')
 	assert.equal(settings.detect_host({ env: { CLAUDE_CODE: '1' } }), 'claude')
+	assert.equal(settings.detect_host({ env: { CLAUDECODE: '1' } }), 'claude')
+	assert.equal(settings.detect_host({ env: { CLAUDE_CODE_SESSION_ID: 'x' } }), 'claude')
 	assert.throws(() => settings.detect_host({ env: { CODEX_SESSION_ID: 'x', CLAUDE_CODE: '1' } }), /ambiguous/)
 	assert.throws(() => settings.detect_host({ env: {} }), /unknown/)
 	assert.throws(() => settings.detect_host({ env: {}, executables: ['claude', 'codex'] }), /unknown/, 'executable presence is not consulted')

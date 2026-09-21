@@ -13,6 +13,19 @@ const setup = require('./setup.js')
 const install_hook = require('./install-hook.js')
 const { format_local_timestamp } = require('./local-time.js')
 
+// The Codex test process can inherit Claude's compatibility marker from its parent.
+// Keep direct host-selection tests single-family; explicit marker tests below still
+// cover both families through ag_settings.host_markers.
+// A Codex worker launched from inside a Claude Code session inherits BOTH host
+// families' runtime markers, which host detection rightly rejects as ambiguous.
+// Resolve only that case; a single-host environment is left alone.
+{
+	const has_marker = host => ag_settings.host_markers[host].some(name => process.env[name])
+	if (has_marker('codex') && has_marker('claude')) {
+		for (const marker of ag_settings.host_markers.claude) delete process.env[marker]
+	}
+}
+
 test('complete output retries when a write accepts only part of the text', () => {
 	const accepted = []
 	const write = (_descriptor, bytes, offset, length) => {

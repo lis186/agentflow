@@ -11,6 +11,17 @@ const { format_local_timestamp } = require('./local-time.js');
 
 const SCRIPT = node_path.join(__dirname, 'notebook-write.js');
 
+// A Codex worker launched from inside a Claude Code session inherits BOTH host
+// families' runtime markers, which host detection rightly rejects as ambiguous.
+// Resolve only that case. In a single-host environment the ambient host is left
+// alone, exactly as these tests have always relied on.
+{
+  const has_marker = host => ag_settings.host_markers[host].some(name => process.env[name]);
+  if (has_marker('codex') && has_marker('claude')) {
+    for (const marker of ag_settings.host_markers.claude) delete process.env[marker];
+  }
+}
+
 node_test.test('writer generates RUN and WIP scaffolds from content without model-authored time', () => {
   const fixture = setup();
   const event = run_writer_stdin(fixture.root, ['append-run', '--notebook', fixture.notebook_path, '--ask', 'A-001', '--input-stdin'], '- Tested the actual change.\n');

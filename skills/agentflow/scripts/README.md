@@ -60,7 +60,9 @@ not a general guarantee that code or a model claim is honest.
 - **`external-runner.js`** — executes one literal command in an independent
   no-remote Git clone and returns bounded output, result-file facts, clone
   changes, and transport facts. Its pre-start Codex check keeps the declared
-  result path worker-owned. Exit status is evidence, not acceptance.
+  result path worker-owned. When configured, it attributes Claude, Codex, and
+  Grok worker traffic to the task without making telemetry a worker failure.
+  Exit status is evidence, not acceptance.
 
 - **`queue-contract.js`** — validates and publishes the planning-only frozen
   queue. It checks exact plan bytes, the digest-bound
@@ -75,7 +77,14 @@ not a general guarantee that code or a model claim is honest.
 
 - **`metrics.js`** — optionally writes validated metrics history and evaluates
   an evidence window. It writes no history when `metrics` is `off`, preserves
-  unavailable provider fields as `unavailable`, and never changes routing.
+  unavailable provider fields as `unavailable`, can enrich stages from ccxray,
+  and never changes routing. For cost reporting, run `ccxray-summary --attempt`
+  after each worker attempt and `--cumulative` at closeout, paste the output
+  verbatim, and treat `.agentflow/evidence/ccxray/` receipts as the audit
+  record; all figures are modeled from recorded rates, not invoices. In a
+  receipt, scope `requests` and `known_usd` are numeric except when its query
+  fails: then both are `null`, `charges` is empty, and `scope_query_failed`
+  records the failure detail.
 
 - **`agf.js`** — the unified owner-facing command. It provides `start`, initialization, setup, hook management, settings, feature-stream work, and safe removal with focused subcommand help. `start --repo <path> --host <codex|claude> --message-stdin --json` resolves or initializes the project, records one exact owner message only in an empty Ask, runs intake, and returns structured startup facts without committing. `agf-looper` intentionally remains standalone. Internal validation and writing scripts are not public command families. Stream actions do not write the root notebook or replace a protocol round with an unrecorded direct Git sequence.
 

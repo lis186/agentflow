@@ -6,6 +6,7 @@ const node_fs = require('node:fs')
 const node_os = require('node:os')
 const node_path = require('node:path')
 const { contain_nested_processes, find_nested_processes, read_process_table } = require('./process-tree.js')
+const { build_ccxray_attribution_prefix, ccxray_install_guidance, ccxray_mode, record_host_touch, resolve_ccxray_endpoint } = require('./metrics.js')
 
 const MAX_OUTPUT_BYTES = 4096
 const DEFAULT_TIMEOUT_MS = 0
@@ -281,25 +282,157 @@ const activity_file_identity = file_path => {
 
 const host_markers = Object.freeze({
   codex: ['CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_CI', 'CODEX_SANDBOX', 'CODEX_CLI'],
-  claude: ['CLAUDE_PROJECT_DIR', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CLI'],
+  claude: ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PROJECT_DIR', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CLI'],
 })
 
-const worker_environment = (command, requested_env) => {
+const telemetry_value = value => {
+  if (value === undefined || value === null) return null
+  const cleaned = String(value).replace(/[\u0000-\u001f\u007f]/gu, '').trim()
+  return cleaned.length === 0 || cleaned.length > 128 ? null : cleaned
+}
+
+const endpoint_url = value => {
+  try {
+    const parsed = new URL(String(value))
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+const comparable_host = hostname => hostname === 'localhost' || hostname === '127.0.0.1' ? 'loopback' : hostname
+
+const same_endpoint_origin = (left, right) => {
+  const left_url = endpoint_url(left)
+  const right_url = endpoint_url(right)
+  if (!left_url || !right_url || left_url.protocol !== right_url.protocol) return false
+  const port = url => url.port || (url.protocol === 'https:' ? '443' : '80')
+  return comparable_host(left_url.hostname) === comparable_host(right_url.hostname) && port(left_url) === port(right_url)
+}
+
+const strip_attribution_paths = pathname => pathname.replace(/\/_ccxray\/attr\/[^/]+/gu, '')
+
+const render_base_url = (parsed, pathname) => `${parsed.origin}${pathname || ''}`
+
+const inherited_base_url = (inherited, endpoint, prefix, suffix = '') => {
+  if (!inherited) return `${endpoint}${prefix}${suffix}`
+  const parsed = endpoint_url(inherited)
+  if (!parsed || !same_endpoint_origin(inherited, endpoint)) return null
+  let pathname = strip_attribution_paths(parsed.pathname)
+  pathname = pathname.replace(/\/+$/u, '')
+  if (suffix !== '' && pathname.endsWith(suffix)) pathname = pathname.slice(0, -suffix.length).replace(/\/+$/u, '')
+  return `${render_base_url(parsed, pathname)}${prefix}${suffix}${parsed.search}${parsed.hash}`
+}
+
+// Every codex subcommand that reaches a model and accepts `-c` (checked against
+// `codex <sub> --help`). `app` is left out on purpose: the desktop launcher's
+// root-level form is the verified one.
+const codex_subcommands = new Set(['exec', 'e', 'review', 'resume', 'fork', 'apply', 'a'])
+
+// Root options that consume the next token (`codex --help`), so that token is
+// never mistaken for a subcommand or a prompt. Found in independent review:
+// with `-a never exec -c x=1` the old partial list stopped at `never`, put the
+// overrides at root level, and codex dropped them again.
+const codex_root_value_options = new Set([
+  '-c', '--config', '--enable', '--disable', '--remote', '--remote-auth-token-env',
+  '-i', '--image', '-m', '--model', '--local-provider', '-p', '--profile',
+  '-s', '--sandbox', '-C', '--cd', '--add-dir', '-a', '--ask-for-approval',
+])
+
+// Index at which config overrides must be inserted: right after the first
+// subcommand token, or 0 when the command has none (interactive use).
+const codex_override_index = args => {
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]
+    if (argument === '--') return 0
+    if (typeof argument !== 'string') return 0
+    if (codex_subcommands.has(argument)) return index + 1
+    if (!argument.startsWith('-')) return 0
+    if (codex_root_value_options.has(argument)) index += 1 // `--opt=value` is one token
+  }
+  return 0
+}
+
+// A codex argument that already routes the model somewhere: `-c key=value`,
+// `--config key=value`, or the joined `--config=key=value` spelling.
+const codex_base_url_override = argument => typeof argument === 'string'
+  && /^(?:--config=)?(?:openai_base_url|chatgpt_base_url)\s*=/u.test(argument)
+
+const apply_injection_args = (args, injection) => {
+  const prefixed = [...(injection?.arg_prefix || []), ...args]
+  const insert = injection?.arg_insert
+  if (!insert || !Array.isArray(insert.args) || insert.args.length === 0) return prefixed
+  const at = (injection?.arg_prefix || []).length + Math.max(0, Math.min(insert.index || 0, args.length))
+  return [...prefixed.slice(0, at), ...insert.args, ...prefixed.slice(at)]
+}
+
+const ccxray_worker_injection = (command, environment, { task, role, project, endpoint } = {}) => {
+  const executable = node_path.basename(command.executable)
+  const args = Array.isArray(command.args) ? command.args : []
+  const values = { task: telemetry_value(task), role: telemetry_value(role), project: telemetry_value(project) }
+  const env_updates = {}
+  for (const key of ['task', 'role', 'project']) if (values[key] !== null) env_updates[`CCXRAY_${key.toUpperCase()}`] = values[key]
+  const prefix = build_ccxray_attribution_prefix(values)
+  if (prefix === '') return { status: 'skipped', reason: 'no_task', env_updates, arg_prefix: [] }
+
+  const endpoint_value = endpoint_url(endpoint)?.origin
+  if (!endpoint_value) return { status: 'skipped', reason: 'ccxray_not_found', env_updates, arg_prefix: [] }
+  if (!['claude', 'codex', 'grok'].includes(executable)) return { status: 'skipped', reason: 'unsupported_executable', env_updates, arg_prefix: [] }
+
+  if (executable === 'codex') {
+    // Same no-override rule as claude/grok: a foreign gateway in the inherited
+    // environment, or a routing override already in the arguments, wins.
+    const inherited_env = environment && typeof environment === 'object' ? environment : {}
+    const foreign_env = ['OPENAI_BASE_URL', 'CHATGPT_BASE_URL'].some(name => inherited_env[name] && !same_endpoint_origin(inherited_env[name], endpoint_value))
+    const custom_base = foreign_env || args.some(codex_base_url_override)
+    if (custom_base) return { status: 'skipped', reason: 'custom_base_url', env_updates, arg_prefix: [] }
+    const base_url = `${endpoint_value}${prefix}/v1`
+    // Codex drops root-level `-c` overrides as soon as the subcommand carries its
+    // own `-c` (observed on 0.154: `codex -c a=1 exec -c b=2` ignores `a`), and
+    // worker commands always carry one for the reasoning effort. So the overrides
+    // go directly after the subcommand when there is one, never before it.
+    return {
+      status: 'active',
+      reason: null,
+      env_updates,
+      arg_prefix: [],
+      arg_insert: {
+        index: codex_override_index(args),
+        args: ['-c', `openai_base_url="${base_url}"`, '-c', `chatgpt_base_url="${base_url}"`],
+      },
+    }
+  }
+
+  const base_name = executable === 'claude' ? 'ANTHROPIC_BASE_URL' : 'GROK_CLI_CHAT_PROXY_BASE_URL'
+  const suffix = executable === 'grok' ? '/v1' : ''
+  const inherited = environment && typeof environment === 'object' ? environment[base_name] : undefined
+  const base_url = inherited_base_url(inherited, endpoint_value, prefix, suffix)
+  if (base_url === null) return { status: 'skipped', reason: 'custom_base_url', env_updates, arg_prefix: [] }
+  env_updates[base_name] = base_url
+  return { status: 'active', reason: null, env_updates, arg_prefix: [] }
+}
+
+const worker_environment = (command, requested_env, telemetry) => {
   const environment = { ...(requested_env || process.env) }
   const executable = node_path.basename(command.executable)
   const opposite = executable === 'claude' ? 'codex' : executable === 'codex' ? 'claude' : null
   if (opposite !== null) for (const marker of host_markers[opposite]) delete environment[marker]
+  if (telemetry && telemetry.env_updates && typeof telemetry.env_updates === 'object') Object.assign(environment, telemetry.env_updates)
   return environment
 }
 
-const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes, termination_grace_ms, max_output_bytes, env, result_file_path }) => new Promise(resolve => {
+const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes, termination_grace_ms, max_output_bytes, env, result_file_path, injection }) => new Promise(resolve => {
   const stdout_capture = make_capture(max_output_bytes)
   const stderr_capture = make_capture(max_output_bytes)
+  const child_args = apply_injection_args(command.args, injection)
+  const started_at = Date.now()
+
   let child
   try {
-    child = node_child_process.spawn(command.executable, command.args, {
+    child = node_child_process.spawn(command.executable, child_args, {
       cwd,
-      env: worker_environment(command, env),
+      env: worker_environment(command, env, injection),
       shell: false,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -315,6 +448,8 @@ const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms,
       activity: { state: stall_timeout_ms > 0 ? 'not_observed' : 'disabled', stall_timeout_ms, sample_count: 0, elapsed_ms: 0, last_change_elapsed_ms: null, last_change_signs: [] },
       process_group_timeout: { trigger: 'none', attempted: false, signals: [], terminated: false, group_after: 'unknown', proof: 'not_needed' },
       nested_worker: { visible: false, detected: false, processes: [], containment: { attempted: false, actions: [] }, poll_count: 0 },
+      started_ms: started_at,
+      ended_ms: Date.now(),
     })
     return
   }
@@ -330,7 +465,6 @@ const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms,
   let finished = false
   let timeout_handle
   let nested_handle
-  const started_at = Date.now()
   let sample_count = 0
   let last_sample = null
   let last_change_at = started_at
@@ -399,6 +533,8 @@ const run_child = ({ command, cwd, timeout_ms, stall_timeout_ms, nested_poll_ms,
       },
       process_group_timeout: timeout_cleanup || { trigger: 'none', attempted: false, signals: [], terminated: false, group_after: 'not_alive', proof: 'not_needed' },
       nested_worker,
+      started_ms: started_at,
+      ended_ms: Date.now(),
     })
   }
 
@@ -541,7 +677,7 @@ const declared_result_output_collision = (command, clone_root, result_file_path)
   return null
 }
 
-const make_result = async (options, clone, command, before_snapshot, child_result, result_file_path) => {
+const make_result = async (options, clone, command, before_snapshot, child_result, result_file_path, telemetry) => {
   const stdout = child_result.stdout
   const stderr = child_result.stderr
   const result_format = options.result_format || 'text'
@@ -567,6 +703,7 @@ const make_result = async (options, clone, command, before_snapshot, child_resul
   return {
     status,
     command: { executable: command.executable, args: command.args },
+    telemetry,
     working_directory: clone.root,
     stdin_closed: true,
     timed_out: child_result.timed_out,
@@ -610,6 +747,8 @@ const make_result = async (options, clone, command, before_snapshot, child_resul
       after: after_snapshot.identity,
       changed: before_snapshot.identity !== after_snapshot.identity,
     },
+    started_ms: child_result.started_ms,
+    ended_ms: child_result.ended_ms,
     process_group_timeout: child_result.process_group_timeout,
     nested_worker: {
       ...child_result.nested_worker,
@@ -649,20 +788,109 @@ const run_external_command = async options => {
   const stall_timeout_ms = values.stall_timeout_ms === undefined ? 0 : values.stall_timeout_ms
   const max_output_bytes = values.max_output_bytes === undefined ? MAX_OUTPUT_BYTES : values.max_output_bytes
   const nested_poll_ms = values.nested_poll_ms === undefined ? DEFAULT_NESTED_POLL_MS : values.nested_poll_ms
+  const attempt = values.attempt === undefined ? 1 : values.attempt
   if (!is_nonnegative_safe_integer(timeout_ms)) throw new Error('timeout_ms must be a non-negative safe integer')
   if (!is_positive_integer(termination_grace_ms)) throw new Error('termination_grace_ms must be a positive integer')
   if (!is_nonnegative_safe_integer(stall_timeout_ms)) throw new Error('stall_timeout_ms must be a non-negative safe integer')
   if (stall_timeout_ms !== 0) throw new Error('quiet-time termination is no longer supported; use an explicit deadline only when authorized')
   if (!is_positive_integer(max_output_bytes)) throw new Error('max_output_bytes must be a positive integer')
   if (!is_nonnegative_safe_integer(nested_poll_ms)) throw new Error('nested_poll_ms must be a non-negative safe integer')
+  if (!is_nonnegative_safe_integer(attempt)) throw new Error('attempt must be a non-negative safe integer')
 
   const clone = prepare_clone(values)
   const result_file_path = normalize_result_file(values.result_file, clone.root)
   const output_collision = declared_result_output_collision(command, clone.root, result_file_path)
   if (output_collision !== null) throw new Error(`Codex ${output_collision.option} must not be used when a declared result path is configured`)
   const before_snapshot = clone_snapshot(clone.root)
-  const child_result = await run_child({ command, cwd: clone.root, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes: values.list_processes, termination_grace_ms, max_output_bytes, env: values.env, result_file_path })
-  return make_result({ ...values, max_output_bytes }, clone, command, before_snapshot, child_result, result_file_path)
+  let mode = 'off'
+  let config_unreadable = false
+  try {
+    mode = values.metrics !== undefined
+      ? ccxray_mode(values.metrics)
+      : values.config_path !== undefined
+        ? ccxray_mode(values.config_path)
+        : 'off'
+  } catch {
+    config_unreadable = true
+    mode = 'off'
+  }
+  let task = null
+  let role = null
+  let project = null
+  let telemetry
+  let injection
+  try {
+    task = telemetry_value(values.task)
+    role = telemetry_value(values.role)
+    project = telemetry_value(values.project)
+    telemetry = {
+      provider: 'ccxray',
+      mode,
+      status: 'off',
+      reason: config_unreadable ? 'config_unreadable' : null,
+      endpoint: null,
+      task,
+      role,
+      project,
+      executable: node_path.basename(command.executable),
+      guidance: null,
+    }
+    if (!config_unreadable && (mode === 'auto' || mode === 'ccxray')) {
+      if (!task) telemetry = { ...telemetry, status: 'skipped', reason: 'no_task' }
+      else {
+        const resolution = await resolve_ccxray_endpoint(values)
+        if (!resolution.endpoint) {
+          telemetry = {
+            ...telemetry,
+            status: 'unavailable',
+            reason: resolution.reason,
+            guidance: mode === 'ccxray' ? ccxray_install_guidance({ reason: resolution.reason }) : null,
+          }
+        } else {
+          injection = ccxray_worker_injection(command, values.env || process.env, { task, role, project, endpoint: resolution.endpoint })
+          telemetry = { ...telemetry, status: injection.status, reason: injection.reason, endpoint: resolution.endpoint }
+        }
+      }
+    }
+  } catch {
+    injection = undefined
+    telemetry = {
+      provider: 'ccxray',
+      mode,
+      status: 'unavailable',
+      reason: 'telemetry_error',
+      endpoint: null,
+      task,
+      role,
+      project,
+      executable: node_path.basename(command.executable),
+      guidance: null,
+    }
+  }
+  const child_result = await run_child({ command, cwd: clone.root, timeout_ms, stall_timeout_ms, nested_poll_ms, list_processes: values.list_processes, termination_grace_ms, max_output_bytes, env: values.env, result_file_path, injection })
+  const result = await make_result({ ...values, max_output_bytes }, clone, command, before_snapshot, child_result, result_file_path, telemetry)
+  if (task !== null) {
+    const cancelled = result.timed_out === true || result.signal !== null && result.signal !== undefined || result.status === 'timed_out' || result.status === 'terminated' || result.process_group_timeout?.trigger === 'deadline'
+    const outcome = cancelled ? 'cancelled' : result.process?.exit_code === 0 ? 'succeeded' : 'failed'
+    try {
+      record_host_touch({
+        repo_root: values.repo_root || values.source_directory || process.cwd(),
+        config_path: values.config_path,
+        config: values.config === undefined ? values.metrics : values.config,
+        env: values.touch_env === undefined ? { ...process.env, ...(values.env || {}) } : values.touch_env,
+        ask: task,
+        event: 'attempt',
+        role: role || 'unknown',
+        project,
+        attempt,
+        outcome,
+        started_ms: result.started_ms,
+        ended_ms: result.ended_ms,
+        ts: result.ended_ms,
+      })
+    } catch {}
+  }
+  return result
 }
 
 module.exports = {
@@ -675,6 +903,8 @@ module.exports = {
   prepare_clone,
   clone_snapshot,
   declared_result_output_collision,
+  ccxray_worker_injection,
+  apply_injection_args,
   worker_environment,
   run_external_command,
 }
