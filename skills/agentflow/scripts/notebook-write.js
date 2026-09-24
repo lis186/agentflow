@@ -8,6 +8,7 @@ const { spawnSync } = require('node:child_process');
 const { TextDecoder } = require('node:util');
 const { lint_round_boundaries, parse_devlog, record_heading_has_valid_local_timestamp } = require('./round-linter');
 const ag_settings = require('./ag-settings');
+const { ccxray_mode } = require('./ccxray-cost.js');
 const { format_local_timestamp } = require('./local-time.js');
 const notebook_owner = require('./notebook-owner');
 
@@ -897,6 +898,18 @@ const append_input = ({ root = process.cwd(), notebook: notebook_path, text, mes
   } finally { release_close_round_lock(lock); }
 };
 
+const ccxray_checkpoint = (repo_root, notebook_path, ask) => {
+  try {
+    const config = ag_settings.active_config_path(repo_root, notebook_path);
+    if (!['on', 'auto'].includes(ccxray_mode(config))) return '';
+    const result = spawnSync(process.execPath, [
+      node_path.join(__dirname, 'ccxray-cost.js'), 'ccxray-summary',
+      '--task', ask, '--config', config, '--cumulative', '--format', 'devlog', '--dry-run'
+    ], { encoding: 'utf8', timeout: 2000 });
+    return result.status === 0 ? result.stdout.trim() : '';
+  } catch { return ''; }
+};
+
 const append_wip = ({ root = process.cwd(), notebook: notebook_path, ask, input: draft_path, input_stdin = false, host, session } = {}) => {
   const repository_root = node_fs.realpathSync(root);
   const notebook_file = resolve_path(repository_root, notebook_path, 'notebook');
@@ -910,7 +923,9 @@ const append_wip = ({ root = process.cwd(), notebook: notebook_path, ask, input:
 
   const inspected = inspect_notebook(notebook.text, ask);
   if (ag_settings.read_notebook_controls(repository_root, notebook_path)['log-verbosity'] === 'off') return { notebook: notebook_path, ask, skipped: true, reason: 'log-verbosity: off' };
-  const rendered = render_record(draft.text, ask, 'WIP', inspected.next_number);
+  const telemetry = ccxray_checkpoint(repository_root, notebook_path, ask);
+  const body = telemetry ? `${draft.text.trimEnd()}\n\n${telemetry}` : draft.text;
+  const rendered = render_record(body, ask, 'WIP', inspected.next_number);
   parse_draft(rendered, ask, inspected.next_number);
   const candidate = build_candidate(notebook, { ...draft, content: Buffer.from(rendered) });
   const candidate_text = candidate.toString('utf8');
@@ -947,7 +962,9 @@ const append_run = ({ root = process.cwd(), notebook: notebook_path, ask, input:
   const inspected = inspect_notebook(notebook.text, ask);
   const verbosity = ag_settings.read_notebook_controls(repository_root, notebook_path)['log-verbosity'];
   if (verbosity !== 'all') return { notebook: notebook_path, ask, skipped: true, reason: `log-verbosity: ${verbosity}` };
-  const rendered = render_record(draft.text, ask, 'RUN', inspected.next_run_number);
+  const telemetry_run = ccxray_checkpoint(repository_root, notebook_path, ask);
+  const run_body = telemetry_run ? `${draft.text.trimEnd()}\n\n${telemetry_run}` : draft.text;
+  const rendered = render_record(run_body, ask, 'RUN', inspected.next_run_number);
   parse_run_draft(rendered, ask, inspected.next_run_number);
   const candidate_draft = inspected.next_run_number === 1
     ? { ...draft, content: Buffer.from(`---${line_ending_for(notebook.content).repeat(2)}${rendered}`) }

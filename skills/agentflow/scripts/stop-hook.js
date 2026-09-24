@@ -146,6 +146,19 @@ const main = () => {
   if (result.ok) {
     const cleanup = require('./completion-cleanup').sweep_completion_records({ project_root: project_dir, notebook_path, config_path });
     if (cleanup.status === 'error') process.stderr.write('Agentflow completion cleanup skipped: ' + cleanup.reason + '\n');
+    try {
+      const { ccxray_mode } = require('./ccxray-cost.js');
+      if (['on', 'auto'].includes(ccxray_mode(config_path))) {
+        const last = parse_devlog(devlog_text).rounds.at(-1);
+        if (last && /^A-\d{3}$/u.test(last.id)) {
+          const { spawn } = require('node:child_process');
+          spawn(process.execPath, [
+            node_path.join(__dirname, 'ccxray-cost.js'), 'ccxray-summary',
+            '--task', last.id, '--config', config_path, '--cumulative'
+          ], { detached: true, stdio: 'ignore' }).unref();
+        }
+      }
+    } catch { /* fail-open */ }
     return 0;
   }
 

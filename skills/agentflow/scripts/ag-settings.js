@@ -28,8 +28,8 @@ const pipeline_role_defaults = Object.freeze({
 	'cross-check': 'better',
 	learn: 'basic',
 })
-const switch_names = Object.freeze(['target-doc', 'workspace-dir', 'cli-provider', 'auto-reply', 'log-verbosity', 'inline-reply', 'lang', 'streams', 'ask-names', 'allow-ag', 'large-work-minutes', 'git-timeout-ms', 'allowed-worker', 'review-policy', 'completion-cleanup', 'completion-cleanup-interval-days'])
-const optional_switch_names = Object.freeze(['completion-cleanup', 'completion-cleanup-interval-days', 'log-verbosity', 'inline-reply', 'git-timeout-ms'])
+const switch_names = Object.freeze(['target-doc', 'workspace-dir', 'cli-provider', 'auto-reply', 'log-verbosity', 'inline-reply', 'lang', 'streams', 'ask-names', 'allow-ag', 'large-work-minutes', 'git-timeout-ms', 'allowed-worker', 'review-policy', 'completion-cleanup', 'completion-cleanup-interval-days', 'ccxray'])
+const optional_switch_names = Object.freeze(['completion-cleanup', 'completion-cleanup-interval-days', 'log-verbosity', 'inline-reply', 'git-timeout-ms', 'ccxray'])
 const legacy_switch_names = Object.freeze(['metrics'])
 const completion_cleanup_defaults = Object.freeze({ 'completion-cleanup': 'off', 'completion-cleanup-interval-days': 7 })
 const notebook_control_defaults = Object.freeze({ 'log-verbosity': 'all', 'inline-reply': 'off' })
@@ -667,6 +667,7 @@ const validate_switches = (config, options, expected_switches, provider_values, 
 		'allow-ag': ['on', 'off', 'ask'],
 		'review-policy': ['prefer-independent', 'require-independent'],
 		'completion-cleanup': ['off', 'on'],
+		ccxray: ['off', 'on', 'auto'],
 	}
 	for (const [key, values] of Object.entries(legal_switches)) {
 		if (expected_switches.includes(key) && has_own(config.switches, key) && !values.includes(config.switches[key])) errors.push(`configuration.switches.${key} must be one of ${values.join(', ')}`)
@@ -906,9 +907,19 @@ const read_json_config = (config_path, options = {}) => {
 		config = migrate_config(config)
 		migrated = true
 	}
-	if (is_plain_object(config?.switches) && ['off', 'on'].includes(config.switches.metrics)) {
-		delete config.switches.metrics
-		migrated = true
+	if (is_plain_object(config?.switches)) {
+		if (['ccxray', 'auto'].includes(config.switches.metrics)) {
+			const target = config.switches.metrics === 'auto' ? 'auto' : 'on'
+			if (has_own(config.switches, 'ccxray') && config.switches.ccxray !== target) {
+				throw new SettingsError('configuration has both metrics and ccxray switches with conflicting values; remove one manually', { code: 'AG_CONFIG_MIGRATION_CONFLICT' })
+			}
+			if (!has_own(config.switches, 'ccxray')) config.switches.ccxray = target
+			delete config.switches.metrics
+			migrated = true
+		} else if (['off', 'on'].includes(config.switches.metrics)) {
+			delete config.switches.metrics
+			migrated = true
+		}
 	}
 
 	try {
@@ -978,6 +989,7 @@ const canonical_config = config => ({
 		'review-policy': config.switches['review-policy'],
 		...(has_own(config.switches, 'completion-cleanup') ? { 'completion-cleanup': config.switches['completion-cleanup'] } : {}),
 		...(has_own(config.switches, 'completion-cleanup-interval-days') ? { 'completion-cleanup-interval-days': config.switches['completion-cleanup-interval-days'] } : {}),
+		...(has_own(config.switches, 'ccxray') ? { ccxray: config.switches.ccxray } : {}),
 	},
 	'pipeline-roles': Object.fromEntries(pipeline_role_names.map(role => [role, config['pipeline-roles'][role]])),
 	'external-workers': config['external-workers'].map(profile => ({
